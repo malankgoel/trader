@@ -552,7 +552,7 @@ if st.session_state.step == 1:
     st.markdown(LIMITATIONS)
     if st.button("Continue"):
         st.session_state.step = 2
-        st.experimental_rerun()
+        st.rerun()
 
 elif st.session_state.step == 2:
     st.subheader("Paste your Strategy JSON")
