@@ -1,0 +1,6 @@
+streamlit==1.48.1
+pandas
+numpy
+yfinance
+matplotlib
+openai
