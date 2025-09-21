@@ -13,6 +13,8 @@ import matplotlib.pyplot as plt
 # UI — Landing page blurb
 # ========================
 
+st.set_page_config(page_title="Strategy Backtester", layout="wide")
+
 FEATURES = """
 **What you can do here**
 - Define strategies as **JSON** with modular blocks: indicators → signals → logic/allocations.
@@ -537,8 +539,6 @@ def plot_drawdown(eq: pd.Series):
 # ========================
 # Streamlit App
 # ========================
-
-st.set_page_config(page_title="Strategy Backtester", layout="wide")
 
 if "step" not in st.session_state:
     st.session_state.step = 1
