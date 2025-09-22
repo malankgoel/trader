@@ -532,6 +532,7 @@ def plot_equity(eq: pd.Series, bench_eq: pd.Series, name: str):
     ))
     fig.add_trace(go.Scatter(
         x=bench_n.index, y=bench_n.values, mode="lines", name="Benchmark (SPY)",
+        line=dict(color="red"),
         hovertemplate="%{x|%Y-%m-%d}<br>Equity: %{y:.3f}<extra></extra>"
     ))
     fig.update_layout(
