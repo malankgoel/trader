@@ -505,37 +505,60 @@ def _reasoning_payload(level: str) -> Dict[str, Any]:
 
 def call_gpt_to_json(user_plain_english: str) -> str:
     """
-    Sends the prompt + user strategy text to GPT and returns the JSON string.
-    Ensures the return is a pure JSON object (str), stripping code fences if present.
+    Use OpenAI Responses API to turn plain-English strategy into a strict JSON object.
+    - Uses MODEL_NAME and MASTER_PROMPT_V3 from content_texts.py
+    - Reads API key from st.secrets["OPENAI_API_KEY"]
+    - Forces JSON-only output via response_format={"type": "json_object"}
+    - Includes backend-only reasoning knob (REASONING_LEVEL)
     """
-    if not _OPENAI_AVAILABLE:
-        raise RuntimeError("openai package not installed. Run: pip install openai")
-
     api_key = st.secrets.get("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("Missing OPENAI_API_KEY in Streamlit secrets.")
 
     client = OpenAI(api_key=api_key)
 
-    messages = [
-        {"role": "system", "content": GPT_SYSTEM_PROMPT},
-        {"role": "user", "content": user_plain_english.strip()}
-    ]
+    # Backend-only reasoning knob (not exposed in UI)
+    effort = (REASONING_LEVEL or "medium").lower()
+    if effort not in {"minimal", "low", "medium", "high"}:
+        effort = "medium"
 
-    resp = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=messages,
-        response_format={"type": "json_object"}
+    resp = client.responses.create(
+        model=MODEL_NAME,  # from content_texts.py
+        response_format={"type": "json_object"},
+        reasoning={"effort": effort},
+        temperature=0,
+        input=[
+            {"role": "system", "content": GPT_SYSTEM_PROMPT},
+            {"role": "user", "content": user_plain_english.strip()},
+        ],
     )
 
-    content = resp.choices[0].message.content.strip()
-    if content.startswith("```"):
-        content = content.strip("`")
-        if content.lower().startswith("json"):
-            content = content[4:]
-        content = content.strip()
-    _ = json.loads(content)
-    return content
+    # Prefer the convenience accessor if available:
+    json_text = getattr(resp, "output_text", None)
+
+    if not json_text:
+        # Fallback extraction across SDK variants
+        parts = []
+        for item in getattr(resp, "output", []) or []:
+            for c in getattr(item, "content", []) or []:
+                # common shapes: {"type": "output_text", "text": "..."}
+                if hasattr(c, "text") and isinstance(c.text, str):
+                    parts.append(c.text)
+                elif isinstance(c, dict) and "text" in c:
+                    parts.append(c["text"])
+        json_text = "".join(parts).strip()
+
+    # Defensive: strip code fences if the model sneaks them in
+    if json_text.startswith("```"):
+        json_text = json_text.strip("`")
+        if json_text.lower().startswith("json"):
+            json_text = json_text[4:]
+        json_text = json_text.strip()
+
+    # Validate now; surfacing JSON errors in the UI instead of failing later
+    _ = json.loads(json_text)
+    return json_text
+
 
 # ========================
 # Streamlit App (UI wiring)
@@ -563,7 +586,7 @@ elif st.session_state.step == 2:
 
     # ---------- Natural Language (GPT) ----------
     with tab_gpt:
-        st.markdown("Describe your strategy in plain English. We'll ask GPT to convert it to the strict JSON schema, then you can review and run it.")
+        st.markdown("Describe your strategy. We'll convert it to the JSON schema, then you can review and run it.")
         nl_text = st.text_area("Strategy", height=200, placeholder="e.g., If QQQ > 200-day SMA then 100% QQQ else 100% BND. Use Yahoo since 2019. Monthly rebalance. Slippage 2 bps.")
 
         colg1, colg2 = st.columns([1, 3])
