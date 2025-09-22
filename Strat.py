@@ -504,49 +504,60 @@ def _reasoning_payload(level: str) -> Dict[str, Any]:
     return {"effort": level}
 
 def call_gpt_to_json(user_plain_english: str) -> str:
+    """
+    Use OpenAI Responses API to turn plain-English strategy into a strict JSON object.
+    - Uses MODEL_NAME and MASTER_PROMPT_V3 from content_texts.py
+    - Reads API key from st.secrets["OPENAI_API_KEY"]
+    - Forces JSON-only output via response_format={"type": "json_object"}
+    - Includes backend-only reasoning knob (REASONING_LEVEL)
+    """
     api_key = st.secrets.get("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("Missing OPENAI_API_KEY in Streamlit secrets.")
 
     client = OpenAI(api_key=api_key)
 
+    # Backend-only reasoning knob (not exposed in UI)
     effort = (REASONING_LEVEL or "medium").lower()
     if effort not in {"minimal", "low", "medium", "high"}:
         effort = "medium"
 
-    # pick a safe ceiling for your schema; tune as needed
-    MAX_JSON_TOKENS = 7000
-
     resp = client.responses.create(
         model=MODEL_NAME,
         reasoning={"effort": effort},
-        max_output_tokens=MAX_JSON_TOKENS,   # <- THIS is the cap
+        max_output_tokens = 5000,
+        temperature=None,
         input=[
             {"role": "system", "content": GPT_SYSTEM_PROMPT},
             {"role": "user", "content": user_plain_english.strip()},
         ],
     )
 
+    # Prefer the convenience accessor if available:
     json_text = getattr(resp, "output_text", None)
+
     if not json_text:
+        # Fallback extraction across SDK variants
         parts = []
         for item in getattr(resp, "output", []) or []:
             for c in getattr(item, "content", []) or []:
+                # common shapes: {"type": "output_text", "text": "..."}
                 if hasattr(c, "text") and isinstance(c.text, str):
                     parts.append(c.text)
                 elif isinstance(c, dict) and "text" in c:
                     parts.append(c["text"])
         json_text = "".join(parts).strip()
 
+    # Defensive: strip code fences if the model sneaks them in
     if json_text.startswith("```"):
         json_text = json_text.strip("`")
         if json_text.lower().startswith("json"):
             json_text = json_text[4:]
         json_text = json_text.strip()
 
-    _ = json.loads(json_text)  # validate
+    # Validate now; surfacing JSON errors in the UI instead of failing later
+    _ = json.loads(json_text)
     return json_text
-
 
 
 # ========================
