@@ -526,8 +526,7 @@ def call_gpt_to_json(user_plain_english: str) -> str:
         model=MODEL_NAME,
         messages=messages,
         temperature=0,
-        response_format={"type": "json_object"},
-        reasoning=_reasoning_payload(REASONING_LEVEL)
+        response_format={"type": "json_object"}
     )
 
     content = resp.choices[0].message.content.strip()
