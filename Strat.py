@@ -517,7 +517,7 @@ def call_gpt_to_json(user_plain_english: str) -> str:
 # ========================
 
 st.set_page_config(page_title="Strategy Backtester", layout="wide")
-st.title("Strategy Backtester (JSON + Yahoo Finance + GPT)")
+st.title("Strategy Backtester")
 
 if "step" not in st.session_state:
     st.session_state.step = 1
@@ -529,7 +529,7 @@ if st.session_state.step == 1:
     st.markdown(LIMITATIONS)
     if st.button("Continue"):
         st.session_state.step = 2
-        st.experimental_rerun()
+        st.rerun()
 
 elif st.session_state.step == 2:
     st.subheader("Choose input method")
