@@ -1,5 +1,4 @@
 import json
-import io
 import math
 from dataclasses import dataclass
 from typing import Dict, Union, Optional, List, Tuple, Any
@@ -8,94 +7,21 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-import plotly.graph_objects as go
-import plotly.express as px
+
+from configuration import FEATURES, LIMITATIONS, MASTER_PROMPT_V3, MODEL_NAME
+
+REASONING_LEVEL = "low"
+
+try:
+    from openai import OpenAI
+    _OPENAI_AVAILABLE = True
+except Exception:
+    _OPENAI_AVAILABLE = False
+
 
 # ========================
-# UI — Landing page blurb
-# ========================
-
-st.set_page_config(page_title="Strategy Backtester", layout="wide")
-
-FEATURES = """
-**What you can do here**
-- Define strategies as **JSON** with modular blocks: indicators → signals → logic/allocations.
-- Supported **indicators**: `sma_price`, `ema_price`, `sma_return`, `std_price`, `std_return`, `rsi`, `drawdown`, `max_drawdown`.
-- Supported **signals**: `gt`, `lt`, `cross_above`, `cross_below`.
-- **Allocations**:
-  - `conditional_weights` (2 branches: when_true / when_false)
-  - `rules` (priority **if / elif / else** with a `default` branch)
-- **Rebalance**: `B` (daily), `W` (weekly last trading day), `M` (month-end).
-- Data source: **Yahoo Finance** (adjusted close).
-"""
-
-LIMITATIONS = """
-**Limitations / assumptions**
-- Only **daily** data from Yahoo is used (no intraday, futures, options, FX).
-- No custom user code inside strategies (use the allowed blocks only).
-- Execution model is simplified: calendar rebalances, single portfolio (no borrowing/leverage),
-  slippage (bps) and per-trade fee are applied on rebalance trades.
-- JSON must be **valid**: no comments, no trailing commas, strings are single-line, `null` not `None`.
-- Weights in each branch should sum to **1.0**.
-"""
-
-EXAMPLE_JSON = """{
-  "version": "1.0",
-  "meta": {
-    "name": "IWM/XLK vs TLT/SHY with Gold Fallback",
-    "notes": "Risk-on if IWM > 200SMA and RSI>=50; else if TLT > 100EMA then rates regime; else gold+cash defensive."
-  },
-  "universe": ["IWM", "XLK", "TLT", "SHY", "GLD"],
-  "data": {
-    "source": "yahoo",
-    "start": "2015-01-01",
-    "end": null,
-    "frequency": "B"
-  },
-  "costs": {
-    "slippage_bps": 2.0,
-    "fee_per_trade": 0.0
-  },
-  "indicators": [
-    { "id": "IWM_SMA200", "type": "sma_price", "params": { "symbol": "IWM", "window": 200 } },
-    { "id": "IWM_RSI14",  "type": "rsi",       "params": { "symbol": "IWM", "window": 14 } },
-    { "id": "TLT_EMA100", "type": "ema_price", "params": { "symbol": "TLT", "window": 100 } }
-  ],
-  "signals": [
-    {
-      "id": "SIG_IWM_GT_SMA",
-      "type": "gt",
-      "left":  { "kind": "price", "symbol": "IWM" },
-      "right": { "kind": "indicator", "ref": "IWM_SMA200" }
-    },
-    {
-      "id": "SIG_IWM_RSI_OK",
-      "type": "gt",
-      "left":  { "kind": "indicator", "ref": "IWM_RSI14" },
-      "right": { "kind": "const", "value": 50.0 }
-    },
-    {
-      "id": "SIG_TLT_GT_EMA",
-      "type": "gt",
-      "left":  { "kind": "price", "symbol": "TLT" },
-      "right": { "kind": "indicator", "ref": "TLT_EMA100" }
-    }
-  ],
-  "logic": { "type": "and", "children": ["SIG_IWM_GT_SMA", "SIG_IWM_RSI_OK"] },
-  "allocation": {
-    "type": "rules",
-    "rules": [
-      { "when": "SIG_IWM_GT_SMA", "weights": { "IWM": 0.7, "XLK": 0.3 } },
-      { "when": "SIG_TLT_GT_EMA", "weights": { "TLT": 0.7, "SHY": 0.3 } },
-      { "default": { "GLD": 0.5, "SHY": 0.5 } }
-    ]
-  },
-  "rebalance": { "frequency": "M" }
-}"""
-
-# ======================================
 # Data adapter (Yahoo)
-# ======================================
+# ========================
 
 def _to_datetime(d):
     if d is None:
@@ -129,9 +55,9 @@ def get_prices(tickers: List[str], start: Optional[str], end: Optional[str], sou
         raise ValueError("Only 'yahoo' source is supported in this app.")
     return fetch_yahoo(tickers, start, end)
 
-# ======================================
-# Core containers & indicators
-# ======================================
+# ========================
+# Core containers & indicators (unchanged)
+# ========================
 
 ArrayLike = Union[pd.Series, pd.DataFrame]
 
@@ -169,7 +95,7 @@ class Indicators:
         s = self.P.close.rolling(window).mean()
         return s if sym is None else s[sym]
 
-    # EMA now uses "window" for consistency
+    # EMA uses "window" for consistency
     def ema_price(self, window: int, sym: Optional[str] = None, adjust: bool = False) -> ArrayLike:
         e = self.P.close.ewm(span=window, adjust=adjust).mean()
         return e if sym is None else e[sym]
@@ -212,7 +138,7 @@ class Indicators:
         return dd.rolling(window).min()
 
 # ========================
-# Signals & allocation helpers
+# Signals & allocation helpers (unchanged)
 # ========================
 
 def _to_series(x: Any, index: pd.DatetimeIndex) -> pd.Series:
@@ -237,7 +163,7 @@ class BrokerCosts:
     fee_per_trade: float = 0.0
 
 # ========================
-# Validation & builders
+# Validation & builders (unchanged, including 'rules' allocator)
 # ========================
 
 ALLOWED_INDICATORS = {
@@ -431,7 +357,7 @@ def rules_weights(
     return W.fillna(0.0)
 
 # ========================
-# Backtester & Metrics
+# Backtester & Metrics (unchanged)
 # ========================
 
 def backtest(close: pd.DataFrame,
@@ -516,63 +442,95 @@ def alpha_beta_r2(strategy_ret: pd.Series, bench_ret: pd.Series) -> Tuple[float,
     return float(alpha * 252), float(beta), float(r2), float(corr)
 
 # ========================
-# Plot helpers (Streamlit)
+# Plot helpers (unchanged)
 # ========================
 
 def plot_equity(eq: pd.Series, bench_eq: pd.Series, name: str):
     base = eq.iloc[0]
     base_b = bench_eq.iloc[0]
-    eq_n = (eq / base).rename(name)
-    bench_n = (bench_eq / base_b).rename("Benchmark (SPY)")
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=eq_n.index, y=eq_n.values, mode="lines", name=name,
-        hovertemplate="%{x|%Y-%m-%d}<br>Equity: %{y:.3f}<extra></extra>"
-    ))
-    fig.add_trace(go.Scatter(
-        x=bench_n.index, y=bench_n.values, mode="lines", name="Benchmark (SPY)",
-        line=dict(color="red"),
-        hovertemplate="%{x|%Y-%m-%d}<br>Equity: %{y:.3f}<extra></extra>"
-    ))
-    fig.update_layout(
-        title="Equity Curve (normalized)",
-        xaxis_title="Date",
-        yaxis_title="Value (x starting equity)",
-        hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    fig.update_xaxes(rangeslider=dict(visible=True))
-    st.plotly_chart(fig, use_container_width=True)
-
+    fig, ax = plt.subplots(figsize=(10, 4.5))
+    (eq / base).plot(ax=ax, label=name)
+    (bench_eq / base_b).plot(ax=ax, label="Benchmark (SPY)")
+    ax.set_title("Equity Curve (normalized)")
+    ax.set_xlabel("Date")
+    ax.legend()
+    st.pyplot(fig)
 
 def plot_drawdown(eq: pd.Series):
     mdd, s, e, dd = max_drawdown_series(eq)
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=dd.index, y=dd.values, mode="lines", name="Drawdown",
-        hovertemplate="%{x|%Y-%m-%d}<br>DD: %{y:.2%}<extra></extra>"
-    ))
-    fig.update_layout(
-        title="Drawdown",
-        xaxis_title="Date",
-        yaxis_title="Drawdown",
-        hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    fig, ax = plt.subplots(figsize=(10, 3.2))
+    dd.plot(ax=ax)
+    ax.set_title("Drawdown")
+    ax.set_xlabel("Date")
+    st.pyplot(fig)
+
+# ========================
+# NEW: GPT utilities
+# ========================
+
+def _reasoning_payload(level: str) -> Dict[str, Any]:
+    # Some GPT-5 Thinking endpoints support a "reasoning" effort knob.
+    # We keep this backend-only per your request.
+    level = (level or "medium").lower()
+    if level not in {"minimal", "low", "medium", "high"}:
+        level = "medium"
+    return {"effort": level}
+
+def call_gpt_to_json(user_plain_english: str) -> str:
+    """
+    Sends the master prompt + user strategy text to GPT and returns the JSON string.
+    Ensures the return is a pure JSON object (str), stripping code fences if present.
+    """
+    if not _OPENAI_AVAILABLE:
+        raise RuntimeError("openai package not installed. Run: pip install openai")
+
+    api_key = st.secrets.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing OPENAI_API_KEY in Streamlit secrets.")
+
+    client = OpenAI(api_key=api_key)
+
+    # We guide the model: 1) list capabilities briefly, 2) output JSON in code fence
+    # MASTER_PROMPT_V3 should already contain explicit schema & rules.
+    messages = [
+        {"role": "system", "content": MASTER_PROMPT_V3},
+        {"role": "user", "content": user_plain_english.strip()}
+    ]
+
+    # Try chat.completions (widely supported). If your environment uses another endpoint,
+    # you can swap to client.responses.create with "response_format={'type':'json_object'}".
+    resp = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        temperature=0,
+        response_format={"type": "json_object"},
+        reasoning=_reasoning_payload(REASONING_LEVEL)
     )
-    fig.update_yaxes(tickformat=".0%")
-    fig.update_xaxes(rangeslider=dict(visible=True))
-    st.plotly_chart(fig, use_container_width=True)
 
+    content = resp.choices[0].message.content.strip()
+    # content *should* be a pure JSON string due to response_format. But if the model
+    # still returns code fences in some variants, strip them defensively.
+    if content.startswith("```"):
+        # Strip ```json ... ```
+        content = content.strip("`")
+        # Remove possible leading 'json\n'
+        if content.lower().startswith("json"):
+            content = content[4:]
+        content = content.strip()
+
+    # Validate JSON parse here to fail fast
+    _ = json.loads(content)
+    return content
 
 # ========================
-# Streamlit App
+# Streamlit App (UI wiring)
 # ========================
+
+st.set_page_config(page_title="Strategy Backtester", layout="wide")
+st.title("Strategy Backtester (JSON + Yahoo Finance + GPT)")
 
 if "step" not in st.session_state:
     st.session_state.step = 1
-
-st.title("Strategy Backtester (JSON + Yahoo Finance)")
 
 if st.session_state.step == 1:
     st.subheader("Overview")
@@ -581,117 +539,327 @@ if st.session_state.step == 1:
     st.markdown(LIMITATIONS)
     if st.button("Continue"):
         st.session_state.step = 2
-        st.rerun()
+        st.experimental_rerun()
 
 elif st.session_state.step == 2:
-    st.subheader("Paste your Strategy JSON")
-    colA, colB = st.columns([2, 1])
-    with colA:
-        json_text = st.text_area("JSON input", value=EXAMPLE_JSON, height=380)
-        uploaded = st.file_uploader("...or upload a .json file", type=["json"])
+    st.subheader("Choose input method")
+
+    tab_gpt, tab_paste, tab_upload = st.tabs(["Natural language (GPT)", "Paste JSON", "Upload JSON"])
+
+    # ---------- Natural Language (GPT) ----------
+    with tab_gpt:
+        st.markdown("Describe your strategy in plain English. We'll ask GPT to convert it to the strict JSON schema, then you can review and run it.")
+        nl_text = st.text_area("Strategy", height=200, placeholder="e.g., If QQQ > 200-day SMA then 100% QQQ else 100% BND. Use Yahoo since 2019. Monthly rebalance. Slippage 2 bps.")
+
+        colg1, colg2 = st.columns([1, 3])
+        with colg1:
+            gen_btn = st.button("Generate JSON with GPT")
+        generated_json_text = st.session_state.get("generated_json_text", "")
+
+        if gen_btn:
+            try:
+                if not nl_text.strip():
+                    st.warning("Please enter your strategy description.")
+                else:
+                    with st.spinner("Calling GPT to generate JSON..."):
+                        content = call_gpt_to_json(nl_text)
+                    st.session_state.generated_json_text = content
+                    st.success("Received JSON from GPT. Review below, edit if needed, then run.")
+                    generated_json_text = content
+            except Exception as e:
+                st.error(f"GPT generation failed: {e}")
+
+        editable_json = st.text_area("Generated JSON (editable)", value=generated_json_text, height=300, key="editable_json_area")
+        run_from_gpt = st.button("Run Backtest (from above JSON)")
+
+        if run_from_gpt and editable_json.strip():
+            try:
+                js = json.loads(editable_json)
+                # ---- run same pipeline as before ----
+                universe = list(js["universe"])
+                bench = "SPY"
+                tk = universe if bench in universe else universe + [bench]
+
+                start = js.get("data", {}).get("start")
+                end = js.get("data", {}).get("end")
+                source = js.get("data", {}).get("source", "yahoo")
+
+                st.write(f"**Fetching data** for: {', '.join(tk)}")
+                close_all = get_prices(tk, start, end, source)
+                if close_all.empty:
+                    st.error("No data returned. Check tickers and dates.")
+                    st.stop()
+
+                validate_strategy(js)
+                panel = PricePanel.from_wide_close(close_all[universe])
+                ind = Indicators(panel)
+
+                ind_map = build_indicators(js, ind)
+                index = panel.close.index
+                sig_map = build_signals(js, ind_map, ind, index)
+
+                logic_node = js.get("logic")
+                final_signal = eval_logic(logic_node, sig_map).reindex(index).fillna(0).astype(int)
+
+                alloc = js["allocation"]
+                if alloc["type"] == "conditional_weights":
+                    weights = conditional_weights(final_signal, alloc["when_true"], alloc["when_false"])
+                elif alloc["type"] == "rules":
+                    weights = rules_weights(alloc["rules"], sig_map, index)
+                else:
+                    raise ValueError("Unsupported allocation type.")
+
+                costs = js.get("costs", {})
+                bt = backtest(
+                    close=panel.close[weights.columns].reindex(index).ffill(),
+                    weights=weights.reindex(index).fillna(0.0),
+                    costs=BrokerCosts(
+                        slippage_bps=float(costs.get("slippage_bps", 2.0)),
+                        fee_per_trade=float(costs.get("fee_per_trade", 0.0)),
+                    ),
+                    freq=js.get("rebalance", {}).get("frequency", "M"),
+                    initial_cash=10_000.0,
+                )
+                eq = bt["equity"]
+                rets = bt["returns"]
+
+                bench_close = close_all[[bench]].reindex(index).ffill()
+                bench_eq = 10_000.0 * (bench_close[bench] / bench_close[bench].iloc[0])
+                bench_ret = bench_eq.pct_change().fillna(0.0)
+
+                # Metrics
+                cum_ret = float(eq.iloc[-1] / eq.iloc[0] - 1)
+                ann_ret = annualized_return(eq)
+                shrp = sharpe_ratio(rets)
+                mdd, dd_s, dd_e, dd_series = max_drawdown_series(eq)
+                calmar = calmar_ratio(eq)
+                tr_1m = trailing_return(eq, 21)
+                tr_3m = trailing_return(eq, 63)
+                alpha, beta, r2, corr = alpha_beta_r2(rets, bench_ret)
+
+                st.success("Backtest complete.")
+                st.subheader("Performance")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Cumulative Return", f"{cum_ret*100:,.2f}%")
+                c2.metric("Annualized Return", f"{ann_ret*100:,.2f}%")
+                c3.metric("Sharpe Ratio", f"{shrp:,.2f}")
+                c4.metric("Max Drawdown", f"{mdd*100:,.2f}%")
+                c5, c6, c7, c8 = st.columns(4)
+                c5.metric("Calmar", f"{calmar:,.2f}")
+                c6.metric("Trailing 1M", f"{(tr_1m*100) if not np.isnan(tr_1m) else float('nan') :,.2f}%")
+                c7.metric("Trailing 3M", f"{(tr_3m*100) if not np.isnan(tr_3m) else float('nan') :,.2f}%")
+                c8.metric("Vol (daily std)", f"{rets.std(ddof=0):.4f}")
+
+                st.subheader("Vs Benchmark (SPY)")
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric("Alpha (annualized)", f"{alpha*100:,.2f}%")
+                d2.metric("Beta", f"{beta:,.2f}")
+                d3.metric("R²", f"{r2:,.2f}")
+                d4.metric("Correlation", f"{corr:,.2f}")
+
+                st.subheader("Charts")
+                plot_equity(eq, bench_eq, js.get("meta", {}).get("name", "Strategy"))
+                plot_drawdown(eq)
+
+                with st.expander("Show target weights (last 10 rows)"):
+                    st.dataframe(weights.tail(10).style.format("{:.2%}"))
+
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    # ---------- Paste JSON ----------
+    with tab_paste:
+        st.markdown("Paste a valid strategy JSON below:")
+        json_text = st.text_area("JSON input", value="", height=320)
+        run_btn = st.button("Run Backtest (pasted JSON)")
+        if run_btn:
+            try:
+                js = json.loads(json_text)
+                # Same pipeline
+                universe = list(js["universe"])
+                bench = "SPY"
+                tk = universe if bench in universe else universe + [bench]
+
+                start = js.get("data", {}).get("start")
+                end = js.get("data", {}).get("end")
+                source = js.get("data", {}).get("source", "yahoo")
+
+                st.write(f"**Fetching data** for: {', '.join(tk)}")
+                close_all = get_prices(tk, start, end, source)
+                if close_all.empty:
+                    st.error("No data returned. Check tickers and dates.")
+                    st.stop()
+
+                validate_strategy(js)
+                panel = PricePanel.from_wide_close(close_all[universe])
+                ind = Indicators(panel)
+
+                ind_map = build_indicators(js, ind)
+                index = panel.close.index
+                sig_map = build_signals(js, ind_map, ind, index)
+
+                logic_node = js.get("logic")
+                final_signal = eval_logic(logic_node, sig_map).reindex(index).fillna(0).astype(int)
+
+                alloc = js["allocation"]
+                if alloc["type"] == "conditional_weights":
+                    weights = conditional_weights(final_signal, alloc["when_true"], alloc["when_false"])
+                elif alloc["type"] == "rules":
+                    weights = rules_weights(alloc["rules"], sig_map, index)
+                else:
+                    raise ValueError("Unsupported allocation type.")
+
+                costs = js.get("costs", {})
+                bt = backtest(
+                    close=panel.close[weights.columns].reindex(index).ffill(),
+                    weights=weights.reindex(index).fillna(0.0),
+                    costs=BrokerCosts(
+                        slippage_bps=float(costs.get("slippage_bps", 2.0)),
+                        fee_per_trade=float(costs.get("fee_per_trade", 0.0)),
+                    ),
+                    freq=js.get("rebalance", {}).get("frequency", "M"),
+                    initial_cash=10_000.0,
+                )
+                eq = bt["equity"]
+                rets = bt["returns"]
+
+                bench_close = close_all[[bench]].reindex(index).ffill()
+                bench_eq = 10_000.0 * (bench_close[bench] / bench_close[bench].iloc[0])
+                bench_ret = bench_eq.pct_change().fillna(0.0)
+
+                cum_ret = float(eq.iloc[-1] / eq.iloc[0] - 1)
+                ann_ret = annualized_return(eq)
+                shrp = sharpe_ratio(rets)
+                mdd, dd_s, dd_e, dd_series = max_drawdown_series(eq)
+                calmar = calmar_ratio(eq)
+                tr_1m = trailing_return(eq, 21)
+                tr_3m = trailing_return(eq, 63)
+                alpha, beta, r2, corr = alpha_beta_r2(rets, bench_ret)
+
+                st.success("Backtest complete.")
+                st.subheader("Performance")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Cumulative Return", f"{cum_ret*100:,.2f}%")
+                c2.metric("Annualized Return", f"{ann_ret*100:,.2f}%")
+                c3.metric("Sharpe Ratio", f"{shrp:,.2f}")
+                c4.metric("Max Drawdown", f"{mdd*100:,.2f}%")
+                c5, c6, c7, c8 = st.columns(4)
+                c5.metric("Calmar", f"{calmar:,.2f}")
+                c6.metric("Trailing 1M", f"{(tr_1m*100) if not np.isnan(tr_1m) else float('nan') :,.2f}%")
+                c7.metric("Trailing 3M", f"{(tr_3m*100) if not np.isnan(tr_3m) else float('nan') :,.2f}%")
+                c8.metric("Vol (daily std)", f"{rets.std(ddof=0):.4f}")
+
+                st.subheader("Vs Benchmark (SPY)")
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric("Alpha (annualized)", f"{alpha*100:,.2f}%")
+                d2.metric("Beta", f"{beta:,.2f}")
+                d3.metric("R²", f"{r2:,.2f}")
+                d4.metric("Correlation", f"{corr:,.2f}")
+
+                st.subheader("Charts")
+                plot_equity(eq, bench_eq, js.get("meta", {}).get("name", "Strategy"))
+                plot_drawdown(eq)
+
+                with st.expander("Show target weights (last 10 rows)"):
+                    st.dataframe(weights.tail(10).style.format("{:.2%}"))
+
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    # ---------- Upload JSON ----------
+    with tab_upload:
+        uploaded = st.file_uploader("Upload a .json file", type=["json"])
         if uploaded is not None:
             try:
                 json_text = uploaded.read().decode("utf-8")
-                st.info("Loaded JSON from uploaded file.")
+                js = json.loads(json_text)
+
+                universe = list(js["universe"])
+                bench = "SPY"
+                tk = universe if bench in universe else universe + [bench]
+
+                start = js.get("data", {}).get("start")
+                end = js.get("data", {}).get("end")
+                source = js.get("data", {}).get("source", "yahoo")
+
+                st.write(f"**Fetching data** for: {', '.join(tk)}")
+                close_all = get_prices(tk, start, end, source)
+                if close_all.empty:
+                    st.error("No data returned. Check tickers and dates.")
+                    st.stop()
+
+                validate_strategy(js)
+                panel = PricePanel.from_wide_close(close_all[universe])
+                ind = Indicators(panel)
+
+                ind_map = build_indicators(js, ind)
+                index = panel.close.index
+                sig_map = build_signals(js, ind_map, ind, index)
+
+                logic_node = js.get("logic")
+                final_signal = eval_logic(logic_node, sig_map).reindex(index).fillna(0).astype(int)
+
+                alloc = js["allocation"]
+                if alloc["type"] == "conditional_weights":
+                    weights = conditional_weights(final_signal, alloc["when_true"], alloc["when_false"])
+                elif alloc["type"] == "rules":
+                    weights = rules_weights(alloc["rules"], sig_map, index)
+                else:
+                    raise ValueError("Unsupported allocation type.")
+
+                costs = js.get("costs", {})
+                bt = backtest(
+                    close=panel.close[weights.columns].reindex(index).ffill(),
+                    weights=weights.reindex(index).fillna(0.0),
+                    costs=BrokerCosts(
+                        slippage_bps=float(costs.get("slippage_bps", 2.0)),
+                        fee_per_trade=float(costs.get("fee_per_trade", 0.0)),
+                    ),
+                    freq=js.get("rebalance", {}).get("frequency", "M"),
+                    initial_cash=10_000.0,
+                )
+                eq = bt["equity"]
+                rets = bt["returns"]
+
+                bench_close = close_all[[bench]].reindex(index).ffill()
+                bench_eq = 10_000.0 * (bench_close[bench] / bench_close[bench].iloc[0])
+                bench_ret = bench_eq.pct_change().fillna(0.0)
+
+                cum_ret = float(eq.iloc[-1] / eq.iloc[0] - 1)
+                ann_ret = annualized_return(eq)
+                shrp = sharpe_ratio(rets)
+                mdd, dd_s, dd_e, dd_series = max_drawdown_series(eq)
+                calmar = calmar_ratio(eq)
+                tr_1m = trailing_return(eq, 21)
+                tr_3m = trailing_return(eq, 63)
+                alpha, beta, r2, corr = alpha_beta_r2(rets, bench_ret)
+
+                st.success("Backtest complete.")
+                st.subheader("Performance")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Cumulative Return", f"{cum_ret*100:,.2f}%")
+                c2.metric("Annualized Return", f"{ann_ret*100:,.2f}%")
+                c3.metric("Sharpe Ratio", f"{shrp:,.2f}")
+                c4.metric("Max Drawdown", f"{mdd*100:,.2f}%")
+                c5, c6, c7, c8 = st.columns(4)
+                c5.metric("Calmar", f"{calmar:,.2f}")
+                c6.metric("Trailing 1M", f"{(tr_1m*100) if not np.isnan(tr_1m) else float('nan') :,.2f}%")
+                c7.metric("Trailing 3M", f"{(tr_3m*100) if not np.isnan(tr_3m) else float('nan') :,.2f}%")
+                c8.metric("Vol (daily std)", f"{rets.std(ddof=0):.4f}")
+
+                st.subheader("Vs Benchmark (SPY)")
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric("Alpha (annualized)", f"{alpha*100:,.2f}%")
+                d2.metric("Beta", f"{beta:,.2f}")
+                d3.metric("R²", f"{r2:,.2f}")
+                d4.metric("Correlation", f"{corr:,.2f}")
+
+                st.subheader("Charts")
+                plot_equity(eq, bench_eq, js.get("meta", {}).get("name", "Strategy"))
+                plot_drawdown(eq)
+
+                with st.expander("Show target weights (last 10 rows)"):
+                    st.dataframe(weights.tail(10).style.format("{:.2%}"))
+
             except Exception as e:
-                st.error(f"Failed to read file: {e}")
-    with colB:
-        st.markdown("**Hints**")
-        st.write("- Keep strings single-line.\n- Use `null` for no end date.\n- Weights per branch must sum to 1.0.")
-        run_btn = st.button("Run Backtest")
-
-    if run_btn:
-        try:
-            js = json.loads(json_text)
-            validate_strategy(js)
-
-            universe = list(js["universe"])
-            bench = "SPY"
-            tk = universe if bench in universe else universe + [bench]
-
-            start = js.get("data", {}).get("start")
-            end = js.get("data", {}).get("end")
-            source = js.get("data", {}).get("source", "yahoo")
-
-            st.write(f"**Fetching data** for: {', '.join(tk)}")
-            close_all = get_prices(tk, start, end, source)
-            if close_all.empty:
-                st.error("No data returned. Check tickers and dates.")
-                st.stop()
-
-            panel = PricePanel.from_wide_close(close_all[universe])
-            ind = Indicators(panel)
-
-            ind_map = build_indicators(js, ind)
-            index = panel.close.index
-            sig_map = build_signals(js, ind_map, ind, index)
-
-            # 'logic' may be unused if allocation is 'rules', but we compute it for completeness
-            logic_node = js.get("logic")
-            final_signal = eval_logic(logic_node, sig_map).reindex(index).fillna(0).astype(int)
-
-            alloc = js["allocation"]
-            if alloc["type"] == "conditional_weights":
-                weights = conditional_weights(final_signal, alloc["when_true"], alloc["when_false"])
-            elif alloc["type"] == "rules":
-                weights = rules_weights(alloc["rules"], sig_map, index)
-            else:
-                raise ValueError("Unsupported allocation type.")
-
-            costs = js.get("costs", {})
-            bt = backtest(
-                close=panel.close[weights.columns].reindex(index).ffill(),
-                weights=weights.reindex(index).fillna(0.0),
-                costs=BrokerCosts(
-                    slippage_bps=float(costs.get("slippage_bps", 2.0)),
-                    fee_per_trade=float(costs.get("fee_per_trade", 0.0)),
-                ),
-                freq=js.get("rebalance", {}).get("frequency", "M"),
-                initial_cash=10_000.0,
-            )
-            eq = bt["equity"]
-            rets = bt["returns"]
-
-            bench_close = close_all[[bench]].reindex(index).ffill()
-            bench_eq = 10_000.0 * (bench_close[bench] / bench_close[bench].iloc[0])
-            bench_ret = bench_eq.pct_change().fillna(0.0)
-
-            # Metrics
-            cum_ret = float(eq.iloc[-1] / eq.iloc[0] - 1)
-            ann_ret = annualized_return(eq)
-            shrp = sharpe_ratio(rets)
-            mdd, dd_s, dd_e, dd_series = max_drawdown_series(eq)
-            calmar = calmar_ratio(eq)
-            tr_1m = trailing_return(eq, 21)
-            tr_3m = trailing_return(eq, 63)
-            alpha, beta, r2, corr = alpha_beta_r2(rets, bench_ret)
-
-            st.success("Backtest complete.")
-            st.subheader("Performance")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Cumulative Return", f"{cum_ret*100:,.2f}%")
-            c2.metric("Annualized Return", f"{ann_ret*100:,.2f}%")
-            c3.metric("Sharpe Ratio", f"{shrp:,.2f}")
-            c4.metric("Max Drawdown", f"{mdd*100:,.2f}%")
-            c5, c6, c7, c8 = st.columns(4)
-            c5.metric("Calmar", f"{calmar:,.2f}")
-            c6.metric("Trailing 1M", f"{(tr_1m*100) if not np.isnan(tr_1m) else float('nan') :,.2f}%")
-            c7.metric("Trailing 3M", f"{(tr_3m*100) if not np.isnan(tr_3m) else float('nan') :,.2f}%")
-            c8.metric("Vol (daily std)", f"{rets.std(ddof=0):.4f}")
-
-            st.subheader("Vs Benchmark (SPY)")
-            d1, d2, d3, d4 = st.columns(4)
-            d1.metric("Alpha (annualized)", f"{alpha*100:,.2f}%")
-            d2.metric("Beta", f"{beta:,.2f}")
-            d3.metric("R²", f"{r2:,.2f}")
-            d4.metric("Correlation", f"{corr:,.2f}")
-
-            st.subheader("Charts")
-            plot_equity(eq, bench_eq, js.get("meta", {}).get("name", "Strategy"))
-            plot_drawdown(eq)
-
-            with st.expander("Show target weights (last 10 rows)"):
-                st.dataframe(weights.tail(10).style.format("{:.2%}"))
-
-        except Exception as e:
-            st.error(f"Error: {e}")
+                st.error(f"Error: {e}")
