@@ -523,10 +523,9 @@ def call_gpt_to_json(user_plain_english: str) -> str:
         effort = "medium"
 
     resp = client.responses.create(
-        model=MODEL_NAME,  # from content_texts.py
-        response_format={"type": "json_object"},
+        model=MODEL_NAME,
         reasoning={"effort": effort},
-        temperature=0,
+        temperature=None,
         input=[
             {"role": "system", "content": GPT_SYSTEM_PROMPT},
             {"role": "user", "content": user_plain_english.strip()},
