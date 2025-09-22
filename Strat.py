@@ -6,7 +6,8 @@ from typing import Dict, Union, Optional, List, Tuple, Any
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+import plotly.express as px
 
 from configuration import FEATURES, LIMITATIONS, GPT_SYSTEM_PROMPT, MODEL_NAME
 
@@ -448,21 +449,47 @@ def alpha_beta_r2(strategy_ret: pd.Series, bench_ret: pd.Series) -> Tuple[float,
 def plot_equity(eq: pd.Series, bench_eq: pd.Series, name: str):
     base = eq.iloc[0]
     base_b = bench_eq.iloc[0]
-    fig, ax = plt.subplots(figsize=(10, 4.5))
-    (eq / base).plot(ax=ax, label=name)
-    (bench_eq / base_b).plot(ax=ax, label="Benchmark (SPY)")
-    ax.set_title("Equity Curve (normalized)")
-    ax.set_xlabel("Date")
-    ax.legend()
-    st.pyplot(fig)
+    eq_n = (eq / base).rename(name)
+    bench_n = (bench_eq / base_b).rename("Benchmark (SPY)")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=eq_n.index, y=eq_n.values, mode="lines", name=name,
+        hovertemplate="%{x|%Y-%m-%d}<br>Equity: %{y:.3f}<extra></extra>"
+    ))
+    fig.add_trace(go.Scatter(
+        x=bench_n.index, y=bench_n.values, mode="lines", name="Benchmark (SPY)",
+        line=dict(color="red"),
+        hovertemplate="%{x|%Y-%m-%d}<br>Equity: %{y:.3f}<extra></extra>"
+    ))
+    fig.update_layout(
+        title="Equity Curve (normalized)",
+        xaxis_title="Date",
+        yaxis_title="Value (x starting equity)",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    fig.update_xaxes(rangeslider=dict(visible=True))
+    st.plotly_chart(fig, use_container_width=True)
+
 
 def plot_drawdown(eq: pd.Series):
     mdd, s, e, dd = max_drawdown_series(eq)
-    fig, ax = plt.subplots(figsize=(10, 3.2))
-    dd.plot(ax=ax)
-    ax.set_title("Drawdown")
-    ax.set_xlabel("Date")
-    st.pyplot(fig)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=dd.index, y=dd.values, mode="lines", name="Drawdown",
+        hovertemplate="%{x|%Y-%m-%d}<br>DD: %{y:.2%}<extra></extra>"
+    ))
+    fig.update_layout(
+        title="Drawdown",
+        xaxis_title="Date",
+        yaxis_title="Drawdown",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    fig.update_yaxes(tickformat=".0%")
+    fig.update_xaxes(rangeslider=dict(visible=True))
+    st.plotly_chart(fig, use_container_width=True)
 
 # ========================
 # NEW: GPT utilities
