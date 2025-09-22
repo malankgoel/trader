@@ -525,7 +525,6 @@ def call_gpt_to_json(user_plain_english: str) -> str:
     resp = client.chat.completions.create(
         model=MODEL_NAME,
         messages=messages,
-        temperature=None,
         response_format={"type": "json_object"}
     )
 
