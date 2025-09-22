@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-from configuration import FEATURES, LIMITATIONS, MASTER_PROMPT_V3, MODEL_NAME
+from configuration import FEATURES, LIMITATIONS, GPT_SYSTEM_PROMPT, MODEL_NAME
 
 REASONING_LEVEL = "low"
 
@@ -478,7 +478,7 @@ def _reasoning_payload(level: str) -> Dict[str, Any]:
 
 def call_gpt_to_json(user_plain_english: str) -> str:
     """
-    Sends the master prompt + user strategy text to GPT and returns the JSON string.
+    Sends the prompt + user strategy text to GPT and returns the JSON string.
     Ensures the return is a pure JSON object (str), stripping code fences if present.
     """
     if not _OPENAI_AVAILABLE:
@@ -490,15 +490,11 @@ def call_gpt_to_json(user_plain_english: str) -> str:
 
     client = OpenAI(api_key=api_key)
 
-    # We guide the model: 1) list capabilities briefly, 2) output JSON in code fence
-    # MASTER_PROMPT_V3 should already contain explicit schema & rules.
     messages = [
-        {"role": "system", "content": MASTER_PROMPT_V3},
+        {"role": "system", "content": GPT_SYSTEM_PROMPT},
         {"role": "user", "content": user_plain_english.strip()}
     ]
 
-    # Try chat.completions (widely supported). If your environment uses another endpoint,
-    # you can swap to client.responses.create with "response_format={'type':'json_object'}".
     resp = client.chat.completions.create(
         model=MODEL_NAME,
         messages=messages,
@@ -508,17 +504,11 @@ def call_gpt_to_json(user_plain_english: str) -> str:
     )
 
     content = resp.choices[0].message.content.strip()
-    # content *should* be a pure JSON string due to response_format. But if the model
-    # still returns code fences in some variants, strip them defensively.
     if content.startswith("```"):
-        # Strip ```json ... ```
         content = content.strip("`")
-        # Remove possible leading 'json\n'
         if content.lower().startswith("json"):
             content = content[4:]
         content = content.strip()
-
-    # Validate JSON parse here to fail fast
     _ = json.loads(content)
     return content
 
