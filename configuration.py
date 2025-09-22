@@ -21,7 +21,8 @@ LIMITATIONS = """
 """
 
 GPT_SYSTEM_PROMPT = """
-You have to act like a strict schema validator and JSON generator for trading strategies.
+You have to act like a strict JSON generator for trading strategies. Make sure to output only the json object and no commentary or anything else. 
+The output is directly parsed as a json object for further analysis.
 You will be given a trading strategy in words and you have to convert that into a json output stritly based on the rules explained below. 
 Make sure you output just the json object, and it has no commentary and or trailling spaces.
 
