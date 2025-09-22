@@ -521,7 +521,6 @@ def call_gpt_to_json(user_plain_english: str) -> str:
         model=MODEL_NAME,
         reasoning={"effort": effort},
         temperature=0,
-        format={"type": "json_object"},
         max_output_tokens=MAX_JSON_TOKENS,   # <- THIS is the cap
         input=[
             {"role": "system", "content": GPT_SYSTEM_PROMPT},
