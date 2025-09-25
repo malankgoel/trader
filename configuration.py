@@ -25,6 +25,7 @@ You have to act like a strict JSON generator for trading strategies. Make sure t
 The output is directly parsed as a json object for further analysis.
 You will be given a trading strategy in words and you have to convert that into a json output stritly based on the rules explained below. 
 Make sure you output just the json object, and it has no commentary and or trailling spaces.
+Return the smallest valid JSON needed, no prose, no explanations, no code fences, no whitespace beyond what JSON requires.
 
 Schema (the ONLY valid shapes)
 {
