@@ -555,6 +555,9 @@ def call_gpt_to_json(user_plain_english: str) -> str:
             json_text = json_text[4:]
         json_text = json_text.strip()
 
+    st.write("DEBUG: Raw GPT output:", json_text[:1000])
+    if not json_text:
+        raise RuntimeError("Model returned empty output")
     # Validate now; surfacing JSON errors in the UI instead of failing later
     _ = json.loads(json_text)
     return json_text
