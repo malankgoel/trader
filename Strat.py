@@ -525,7 +525,7 @@ def call_gpt_to_json(user_plain_english: str) -> str:
     resp = client.responses.create(
         model=MODEL_NAME,
         reasoning={"effort": effort},
-        max_completion_tokens = 5000,
+        max_output_tokens=600,
         temperature=None,
         input=[
             {"role": "system", "content": GPT_SYSTEM_PROMPT},
