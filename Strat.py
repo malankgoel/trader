@@ -525,7 +525,6 @@ def call_gpt_to_json(user_plain_english: str) -> str:
     resp = client.responses.create(
         model=MODEL_NAME,
         max_output_tokens=6000,
-        response_format={"type": "json_object"},
         reasoning={"effort": effort},
         temperature=None,
         input=[
