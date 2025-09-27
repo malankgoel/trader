@@ -894,7 +894,7 @@ elif st.session_state.step == 2:
             "universe":["AAPL","TSLA","BIL"],
             "data":{"source":"yahoo","start":"2018-01-01","end":None,"frequency":"B"},
             "costs":{"slippage_bps":2,"fee_per_trade":0},
-            "indicators":None,
+            "indicators":[],
             "signals":[],
             "logic": None,
             "allocation": {"type":"conditional_weights","when_true":{},"when_false":{}},
@@ -960,8 +960,13 @@ elif st.session_state.step == 2:
             index = panel.close.index
             sig_map = build_signals(js, ind_map, ind, index)
 
-            logic_node = js.get("logic")  # signal id or None
-            final_signal = eval_logic(logic_node, sig_map).reindex(index).fillna(0).astype(int)
+            # Build final_signal safely even if there are no signals yet
+            logic_node = js.get("logic")
+            if not sig_map:
+                final_signal = pd.Series(0, index=index)  # treat as always false
+            else:
+                final_signal = eval_logic(logic_node, sig_map).reindex(index).fillna(0).astype(int)
+
 
             alloc = js["allocation"]
             if alloc.get("type") == "conditional_weights":
