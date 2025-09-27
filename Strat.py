@@ -11,6 +11,309 @@ import plotly.express as px
 
 from configuration import FEATURES, LIMITATIONS, GPT_SYSTEM_PROMPT, MODEL_NAME
 
+from typing import Literal
+
+# --- Block dictionaries you support (used for tolerant mapping) ---
+_ALLOWED_INDICATORS = {
+    "sma_price": {"req": ["symbol", "window"]},
+    "ema_price": {"req": ["symbol", "window"]},
+    "sma_return": {"req": ["symbol", "window"]},
+    "std_price": {"req": ["symbol", "window"], "opt": ["ddof"]},
+    "std_return": {"req": ["symbol", "window"], "opt": ["ddof"]},
+    "rsi": {"req": ["symbol", "window"]},
+    "drawdown": {"req": ["symbol", "window"]},
+    "max_drawdown": {"req": ["symbol", "window"]},
+}
+
+_ALLOWED_SIGNALS = {"gt", "lt", "cross_above", "cross_below"}
+
+def _closest_indicator(name: str) -> str:
+    if name in _ALLOWED_INDICATORS:
+        return name
+    n = name.replace("-", "_").replace(" ", "_").lower()
+    for k in _ALLOWED_INDICATORS.keys():
+        if n == k or n.startswith(k.split("_")[0]):  # loose match e.g. "sma" -> "sma_price"
+            return k
+    # fallback to sma_price as the most common
+    return "sma_price"
+
+def _closest_signal(name: str) -> str:
+    n = str(name).replace("-", "_").lower()
+    if n in _ALLOWED_SIGNALS:
+        return n
+    if "gt" in n or "greater" in n:
+        return "gt"
+    if "lt" in n or "less" in n:
+        return "lt"
+    if "cross" in n and ("above" in n or "up" in n):
+        return "cross_above"
+    if "cross" in n and ("below" in n or "down" in n):
+        return "cross_below"
+    return "gt"
+
+def _clean_symbol(s):
+    return str(s).strip().upper()
+
+def _safe_num(x, default):
+    try:
+        return int(x)
+    except Exception:
+        try:
+            return float(x)
+        except Exception:
+            return default
+
+def normalize_strategy_json(js: dict) -> dict:
+    """
+    Snap a possibly imperfect GPT JSON to the nearest valid schema for building blocks.
+    """
+    out = {
+        "version": "1.0",
+        "meta": {"name": "", "notes": ""},
+        "universe": [],
+        "data": {"source": "yahoo", "start": "2015-01-01", "end": None, "frequency": "B"},
+        "costs": {"slippage_bps": 0, "fee_per_trade": 0},
+        "indicators": [],
+        "signals": [],
+        "logic": None,
+        "allocation": {"type": "conditional_weights", "when_true": {}, "when_false": {}},
+        "rebalance": {"frequency": "M"},
+    }
+
+    # meta
+    meta = js.get("meta", {})
+    out["meta"]["name"] = str(meta.get("name", "")).strip()[:80]
+    out["meta"]["notes"] = str(meta.get("notes", "")).strip()
+
+    # universe
+    univ = js.get("universe", [])
+    if isinstance(univ, list):
+        out["universe"] = [_clean_symbol(s) for s in univ if str(s).strip()]
+
+    # data
+    data = js.get("data", {})
+    if isinstance(data, dict):
+        out["data"]["source"] = (data.get("source") or "yahoo").lower()
+        out["data"]["start"] = data.get("start") or "2015-01-01"
+        out["data"]["end"] = data.get("end", None)
+        out["data"]["frequency"] = data.get("frequency") or "B"
+
+    # costs
+    costs = js.get("costs", {})
+    if isinstance(costs, dict):
+        out["costs"]["slippage_bps"] = _safe_num(costs.get("slippage_bps", 0), 0)
+        out["costs"]["fee_per_trade"] = _safe_num(costs.get("fee_per_trade", 0), 0)
+
+    # indicators
+    for item in js.get("indicators", []) or []:
+        if not isinstance(item, dict):
+            continue
+        t = _closest_indicator(item.get("type", "sma_price"))
+        sym = _clean_symbol(item.get("params", {}).get("symbol", (out["universe"] or ["SPY"])[0]))
+        window = _safe_num(item.get("params", {}).get("window", 200), 200)
+        ddof = _safe_num(item.get("params", {}).get("ddof", 0), 0)
+        out["indicators"].append({
+            "id": item.get("id", f"{t}_{sym}_{window}")[:64],
+            "type": t,
+            "params": {"symbol": sym, "window": window, **({"ddof": ddof} if "ddof" in _ALLOWED_INDICATORS[t].get("opt", []) else {})}
+        })
+
+    # signals
+    for item in js.get("signals", []) or []:
+        if not isinstance(item, dict):
+            continue
+        stype = _closest_signal(item.get("type", "gt"))
+        left = item.get("left", {})
+        right = item.get("right", {})
+        out["signals"].append({
+            "id": item.get("id", f"{stype}_{len(out['signals'])+1}")[:64],
+            "type": stype,
+            "left": left,
+            "right": right
+        })
+
+    # logic
+    # logic + allocation
+    lg = js.get("logic")
+    if isinstance(lg, dict):
+        if "conditional_weights" in lg:
+            cw = lg["conditional_weights"] or {}
+            cond = cw.get("condition") or (out["signals"][0]["id"] if out["signals"] else None)
+            wt_t = { _clean_symbol(k): float(v) for k, v in (cw.get("when_true") or {}).items() if k }
+            wt_f = { _clean_symbol(k): float(v) for k, v in (cw.get("when_false") or {}).items() if k }
+            out["logic"] = cond
+            out["allocation"] = {"type":"conditional_weights","when_true":wt_t,"when_false":wt_f}
+        elif "rules" in lg:
+            rules_in = lg.get("rules") or []
+            rules = []
+            for r in rules_in:
+                if "default" in r:
+                    rules.append({"default": { _clean_symbol(k): float(v) for k, v in (r["default"] or {}).items() }})
+                else:
+                    rules.append({
+                        "when": r.get("when", (out["signals"][0]["id"] if out["signals"] else "")),
+                        "weights": { _clean_symbol(k): float(v) for k, v in (r.get("weights") or {}).items() }
+                    })
+            out["logic"] = None
+            out["allocation"] = {"type":"rules","rules":rules}
+    elif isinstance(lg, (str, type(None))):
+        # accept string (signal id) or None and leave allocation as-is (maybe GPT set it directly)
+        out["logic"] = lg
+
+    alloc = js.get("allocation")
+    if isinstance(alloc, dict):
+        if alloc.get("type") == "rules" or "rules" in alloc:
+            rules = []
+            for r in alloc.get("rules", []):
+                if "default" in r:
+                    rules.append({"default": { _clean_symbol(k): float(v) for k, v in (r["default"] or {}).items() }})
+                else:
+                    rules.append({"when": r.get("when"), "weights": { _clean_symbol(k): float(v) for k, v in (r.get("weights") or {}).items() }})
+            out["allocation"] = {"type":"rules","rules":rules}
+        elif alloc.get("type") == "conditional_weights":
+            wt_t = { _clean_symbol(k): float(v) for k, v in (alloc.get("when_true") or {}).items() }
+            wt_f = { _clean_symbol(k): float(v) for k, v in (alloc.get("when_false") or {}).items() }
+            out["allocation"] = {"type":"conditional_weights","when_true":wt_t,"when_false":wt_f}
+
+    # rebalance
+    rb = js.get("rebalance", {})
+    if isinstance(rb, dict):
+        f = str(rb.get("frequency", "M")).upper()
+        out["rebalance"]["frequency"] = f if f in {"B", "W", "M"} else "M"
+
+    return out
+
+# ---------- UI building blocks ----------
+
+def _weights_editor(label: str, tickers: List[str], value: Dict[str, float]):
+    cols = st.columns(max(2, min(4, len(tickers))))
+    newv = {}
+    for i, t in enumerate(tickers):
+        with cols[i % len(cols)]:
+            newv[t] = st.number_input(f"{label} • {t}", value=float(value.get(t, 0.0)), step=0.05, min_value=0.0, max_value=1.0, key=f"{label}_{t}")
+    s = sum(newv.values())
+    if s and abs(s - 1.0) > 1e-6:
+        st.info(f"Tip: weights sum to {s:.2f}. Most users target 1.00.")
+    return newv
+
+def _indicators_editor(universe: List[str], indicators: List[dict]):
+    st.caption("Indicators")
+    edited = []
+    with st.container(border=True):
+        count = st.number_input("How many indicators?", min_value=0, max_value=30, value=len(indicators))
+        for i in range(int(count)):
+            default = indicators[i] if i < len(indicators) else {}
+            st.subheader(f"Indicator #{i+1}")
+            c1, c2 = st.columns(2)
+            with c1:
+                typ = st.selectbox("Type", list(_ALLOWED_INDICATORS.keys()), index=0 if default.get("type") not in _ALLOWED_INDICATORS else list(_ALLOWED_INDICATORS.keys()).index(default["type"]), key=f"ind_type_{i}")
+                sym = st.selectbox("Symbol", options=universe or ["SPY"], index=0, key=f"ind_sym_{i}")
+            with c2:
+                window = st.number_input("Window", min_value=1, max_value=1000, value=int(default.get("params", {}).get("window", 200)), key=f"ind_win_{i}")
+                ddof = st.number_input("ddof (if applicable)", min_value=0, max_value=10, value=int(default.get("params", {}).get("ddof", 0)), key=f"ind_ddof_{i}")
+            iid = st.text_input("ID", value=default.get("id", f"{typ}_{sym}_{window}")[:64], key=f"ind_id_{i}")
+            params = {"symbol": sym, "window": int(window)}
+            if "ddof" in _ALLOWED_INDICATORS[typ].get("opt", []):
+                params["ddof"] = int(ddof)
+            edited.append({"id": iid, "type": typ, "params": params})
+    return edited
+
+def _signals_editor(signals: List[dict], indicators: List[dict], universe: List[str]):
+    st.caption("Signals")
+    edited = []
+    with st.container(border=True):
+        count = st.number_input("How many signals?", min_value=0, max_value=30, value=len(signals))
+        ind_ids = [i["id"] for i in indicators]
+        for i in range(int(count)):
+            default = signals[i] if i < len(signals) else {}
+            st.subheader(f"Signal #{i+1}")
+            typ = st.selectbox("Type", list(_ALLOWED_SIGNALS), index=0 if default.get("type") not in _ALLOWED_SIGNALS else list(_ALLOWED_SIGNALS).index(default["type"]), key=f"sig_type_{i}")
+            # simple left/right pickers: indicator vs price vs constant
+            tabs = st.tabs(["Left", "Right"])
+            with tabs[0]:
+                lkind = st.radio("Left side", ["indicator", "price", "const"], horizontal=True, key=f"sig_left_kind_{i}")
+                if lkind == "indicator":
+                    ref = st.selectbox("Indicator ref", ind_ids or ["—"], key=f"sig_left_ref_{i}")
+                    left = {"kind": "indicator", "ref": ref}
+                elif lkind == "price":
+                    sym = st.selectbox("Price symbol", options=universe or ["SPY"], key=f"sig_left_price_{i}")
+                    left = {"kind": "price", "symbol": sym}
+                else:
+                    val = st.number_input("Constant value", value=float(default.get("left", {}).get("value", 0.0)), key=f"sig_left_const_{i}")
+                    left = {"kind": "const", "value": float(val)}
+            with tabs[1]:
+                rkind = st.radio("Right side", ["indicator", "price", "const"], horizontal=True, key=f"sig_right_kind_{i}")
+                if rkind == "indicator":
+                    ref = st.selectbox("Indicator ref ", ind_ids or ["—"], key=f"sig_right_ref_{i}")
+                    right = {"kind": "indicator", "ref": ref}
+                elif rkind == "price":
+                    sym = st.selectbox("Price symbol ", options=universe or ["SPY"], key=f"sig_right_price_{i}")
+                    right = {"kind": "price", "symbol": sym}
+                else:
+                    val = st.number_input("Constant value ", value=float(default.get("right", {}).get("value", 0.0)), key=f"sig_right_const_{i}")
+                    right = {"kind": "const", "value": float(val)}
+            sid = st.text_input("ID", value=default.get("id", f"{typ}_{i+1}")[:64], key=f"sig_id_{i}")
+            edited.append({"id": sid, "type": typ, "left": left, "right": right})
+    return edited
+
+def _logic_and_alloc_editor(universe: List[str], signals: List[dict], logic: Union[None,str,dict], allocation: Dict[str, Any]):
+    st.caption("Logic & Allocation")
+    sig_ids = [s["id"] for s in signals]
+    chosen = st.selectbox("Primary logic (signal id)", options=(sig_ids or [""]), index=0)
+    logic_out = chosen if chosen else None
+
+    mode = st.radio("Allocation type", ["conditional_weights", "rules"], horizontal=True, key="alloc_mode")
+    if mode == "conditional_weights":
+        st.markdown("**Weights when logic == TRUE (1)**")
+        wt_true = _weights_editor("when_true", universe, (allocation.get("when_true") if allocation.get("type")=="conditional_weights" else {}) or {t:0.0 for t in universe})
+        st.markdown("**Weights when logic == FALSE (0)**")
+        wt_false = _weights_editor("when_false", universe, (allocation.get("when_false") if allocation.get("type")=="conditional_weights" else {}) or {t:0.0 for t in universe})
+        alloc_out = {"type":"conditional_weights","when_true":wt_true,"when_false":wt_false}
+    else:
+        rules = allocation.get("rules", []) if allocation.get("type")=="rules" else []
+        cnt = st.number_input("How many rules (including default)?", min_value=1, max_value=30, value=max(1, len(rules) or 1))
+        built = []
+        for i in range(int(cnt)):
+            st.subheader(f"Rule #{i+1}")
+            is_default = st.checkbox("Default rule (else)", value=("default" in (rules[i] if i < len(rules) else {})), key=f"rule_default_{i}")
+            if is_default:
+                w = _weights_editor(f"default_{i}", universe, (rules[i].get("default", {}) if i < len(rules) else {t:0.0 for t in universe}))
+                built.append({"default": w})
+            else:
+                when = st.selectbox("When (signal id)", options=sig_ids or [""], index=0, key=f"rule_when_{i}")
+                w = _weights_editor(f"weights_{i}", universe, (rules[i].get("weights", {}) if i < len(rules) else {t:0.0 for t in universe}))
+                built.append({"when": when, "weights": w})
+        alloc_out = {"type":"rules","rules":built}
+    return logic_out, alloc_out
+
+
+def _rebalance_editor(rb: dict):
+    st.caption("Rebalance")
+    freq = st.selectbox("Frequency", ["B", "W", "M"], index=["B","W","M"].index(rb.get("frequency","M")))
+    return {"frequency": freq}
+
+def _data_editor(data: dict):
+    st.caption("Data")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        src = st.selectbox("Source", ["yahoo"], index=0)
+    with c2:
+        start = st.text_input("Start (YYYY-MM-DD)", value=data.get("start","2015-01-01"))
+    with c3:
+        end = st.text_input("End (YYYY-MM-DD or empty)", value=data.get("end") or "")
+    freq = st.selectbox("Calendar", ["B"], index=0)
+    return {"source": src, "start": start, "end": (end or None), "frequency": freq}
+
+def _costs_editor(costs: dict):
+    st.caption("Costs")
+    c1, c2 = st.columns(2)
+    with c1:
+        slp = st.number_input("Slippage (bps)", min_value=0, max_value=1000, value=int(costs.get("slippage_bps",0)))
+    with c2:
+        fee = st.number_input("Fee per trade ($)", min_value=0, max_value=100, value=int(costs.get("fee_per_trade",0)))
+    return {"slippage_bps": slp, "fee_per_trade": fee}
+
+
 REASONING_LEVEL = "low"
 
 try:
@@ -228,9 +531,9 @@ def build_indicators(js: Dict[str, Any], indicators: Indicators) -> Dict[str, Ar
         elif t == "sma_return":
             out[iid] = indicators.sma_return(p["window"], p["symbol"])
         elif t == "std_price":
-            out[iid] = indicators.std_price(p["window"], p.get("symbol"))
+            out[iid] = indicators.std_price(p["window"], p.get("symbol"), p.get("ddof", 0))
         elif t == "std_return":
-            out[iid] = indicators.std_return(p["window"], p.get("symbol"))
+            out[iid] = indicators.std_return(p["window"], p.get("symbol"), p.get("ddof", 0))
         elif t == "rsi":
             out[iid] = indicators.rsi(p.get("window", 14), p["symbol"])
         elif t == "drawdown":
@@ -503,64 +806,36 @@ def _reasoning_payload(level: str) -> Dict[str, Any]:
         level = "medium"
     return {"effort": level}
 
-def call_gpt_to_json(user_plain_english: str) -> str:
-    """
-    Use OpenAI Responses API to turn plain-English strategy into a strict JSON object.
-    - Uses MODEL_NAME and MASTER_PROMPT_V3 from content_texts.py
-    - Reads API key from st.secrets["OPENAI_API_KEY"]
-    - Forces JSON-only output via response_format={"type": "json_object"}
-    - Includes backend-only reasoning knob (REASONING_LEVEL)
-    """
-    api_key = st.secrets.get("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("Missing OPENAI_API_KEY in Streamlit secrets.")
+# somewhere in Strat.py or a small `llm.py` you import
+from openai import OpenAI
 
-    client = OpenAI(api_key=api_key)
-
-    # Backend-only reasoning knob (not exposed in UI)
-    effort = (REASONING_LEVEL or "medium").lower()
-    if effort not in {"minimal", "low", "medium", "high"}:
-        effort = "medium"
-
+def call_openai_to_json(user_prompt: str, system_prompt: str, model: str, reasoning: Literal["low","medium","high"]="low") -> dict:
+    client = OpenAI()
     resp = client.responses.create(
-        model=MODEL_NAME,
-        max_output_tokens=6000,
-        reasoning={"effort": effort},
-        temperature=None,
+        model=model,
+        reasoning={"effort": reasoning},
         input=[
-            {"role": "system", "content": GPT_SYSTEM_PROMPT},
-            {"role": "user", "content": user_plain_english.strip()},
+            {"role":"system","content":system_prompt},
+            {"role":"user","content":user_prompt}
         ],
+        temperature=0.1,
+        max_output_tokens=5000,  # keep tight since it must be JSON
     )
+    text = resp.output_text.strip()
+    # sometimes models add code fences—strip safely
+    if text.startswith("```"):
+        text = text.strip("`")
+        # remove language hints like ```json
+        text = text.split("\n",1)[1] if "\n" in text else text
+    try:
+        return json.loads(text)
+    except Exception:
+        # last-ditch: try to find the first/last braces
+        l = text.find("{"); r = text.rfind("}")
+        if l!=-1 and r!=-1 and r>l:
+            return json.loads(text[l:r+1])
+        raise
 
-    # Prefer the convenience accessor if available:
-    json_text = getattr(resp, "output_text", None)
-
-    if not json_text:
-        # Fallback extraction across SDK variants
-        parts = []
-        for item in getattr(resp, "output", []) or []:
-            for c in getattr(item, "content", []) or []:
-                # common shapes: {"type": "output_text", "text": "..."}
-                if hasattr(c, "text") and isinstance(c.text, str):
-                    parts.append(c.text)
-                elif isinstance(c, dict) and "text" in c:
-                    parts.append(c["text"])
-        json_text = "".join(parts).strip()
-
-    # Defensive: strip code fences if the model sneaks them in
-    if json_text.startswith("```"):
-        json_text = json_text.strip("`")
-        if json_text.lower().startswith("json"):
-            json_text = json_text[4:]
-        json_text = json_text.strip()
-
-    st.write("DEBUG: Raw GPT output:", json_text[:1000])
-    if not json_text:
-        raise RuntimeError("Model returned empty output")
-    # Validate now; surfacing JSON errors in the UI instead of failing later
-    _ = json.loads(json_text)
-    return json_text
 
 
 # ========================
@@ -569,6 +844,8 @@ def call_gpt_to_json(user_plain_english: str) -> str:
 
 st.set_page_config(page_title="Strategy Backtester", layout="wide")
 st.title("Strategy Backtester")
+if "block_state" not in st.session_state:
+    st.session_state["block_state"] = None
 
 if "step" not in st.session_state:
     st.session_state.step = 1
@@ -583,324 +860,150 @@ if st.session_state.step == 1:
         st.rerun()
 
 elif st.session_state.step == 2:
-    st.subheader("Choose input method")
+    st.header("Build your strategy")
 
-    tab_gpt, tab_paste, tab_upload = st.tabs(["Natural language (GPT)", "Paste JSON", "Upload JSON"])
+    tab1, tab2, tab3 = st.tabs(["Describe with GPT", "Build with Blocks", "Paste JSON"])
 
-    # ---------- Natural Language (GPT) ----------
-    with tab_gpt:
-        st.markdown("Describe your strategy. We'll convert it to the JSON schema, then you can review and run it.")
-        nl_text = st.text_area("Strategy", height=200, placeholder="e.g., If QQQ > 200-day SMA then 100% QQQ else 100% BND. Use Yahoo since 2019. Monthly rebalance. Slippage 2 bps.")
+    with tab1:
+        st.markdown("Describe the strategy in English. We'll ask GPT to generate JSON and convert it to blocks you can edit.")
+        prompt = st.text_area("Strategy description", height=160, placeholder="e.g., 50/50 AAPL/TSLA; hedge to BIL when either stock is below its 200-day SMA. Weekly rebalance.")
+        use_model = MODEL_NAME
+        c1, c2 = st.columns([1,1])
+        with c1:
+            run_gpt = st.button("Generate & Convert to Blocks")
+        with c2:
+            st.caption(f"Model: {use_model} · Reasoning: {REASONING_LEVEL}")
 
-        colg1, colg2 = st.columns([1, 3])
-        with colg1:
-            gen_btn = st.button("Generate JSON with GPT")
-        generated_json_text = st.session_state.get("generated_json_text", "")
-
-        if gen_btn:
+        if run_gpt and prompt.strip():
             try:
-                if not nl_text.strip():
-                    st.warning("Please enter your strategy description.")
-                else:
-                    with st.spinner("Calling GPT to generate JSON..."):
-                        content = call_gpt_to_json(nl_text)
-                    st.session_state.generated_json_text = content
-                    st.success("Received JSON from GPT. Review below, edit if needed, then run.")
-                    generated_json_text = content
+                # ---- your existing OpenAI call lives in a function like this: ----
+                # Replace with your Responses API call if you’ve already migrated.
+                js_raw = call_openai_to_json(prompt, system_prompt=GPT_SYSTEM_PROMPT, model=use_model, reasoning=REASONING_LEVEL)
+                js = normalize_strategy_json(js_raw)
+                st.session_state["block_state"] = js
+                st.success("Converted GPT JSON into editable blocks.")
             except Exception as e:
                 st.error(f"GPT generation failed: {e}")
 
-        editable_json = st.text_area("Generated JSON (editable)", value=generated_json_text, height=300, key="editable_json_area")
-        run_from_gpt = st.button("Run Backtest (from above JSON)")
+    with tab2:
+        st.markdown("Build the strategy using blocks. No GPT.")
+        # if user already generated or pasted, preload; else a small starter
+        base = st.session_state.get("block_state") or {
+            "version":"1.0",
+            "meta":{"name":"My Strategy","notes":""},
+            "universe":["AAPL","TSLA","BIL"],
+            "data":{"source":"yahoo","start":"2018-01-01","end":None,"frequency":"B"},
+            "costs":{"slippage_bps":2,"fee_per_trade":0},
+            "indicators":None,
+            "signals":[],
+            "logic": None,
+            "allocation": {"type":"conditional_weights","when_true":{},"when_false":{}},
+            "rebalance":{"frequency":"W"},
+        }
+        st.subheader("Meta")
+        base["meta"]["name"] = st.text_input("Name", value=base["meta"].get("name",""))
+        base["meta"]["notes"] = st.text_area("Notes", value=base["meta"].get("notes",""), height=80)
 
-        if run_from_gpt and editable_json.strip():
+        st.subheader("Universe")
+        uni_str = st.text_input("Tickers (comma-separated)", value=",".join(base.get("universe") or []))
+        base["universe"] = [_clean_symbol(x) for x in uni_str.split(",") if x.strip()]
+
+        base["data"] = _data_editor(base.get("data", {}))
+        base["costs"] = _costs_editor(base.get("costs", {}))
+
+        base["indicators"] = _indicators_editor(base["universe"], base.get("indicators", []))
+        base["signals"] = _signals_editor(base.get("signals", []), base["indicators"], base["universe"])
+        logic_out, alloc_out = _logic_and_alloc_editor(base["universe"], base["signals"], base.get("logic", None), base.get("allocation", {}))
+        base["logic"] = logic_out
+        base["allocation"] = alloc_out
+        base["rebalance"] = _rebalance_editor(base.get("rebalance", {}))
+
+
+        st.session_state["block_state"] = base
+        st.info("Blocks are live. When you backtest, we'll compile to JSON on the fly.")
+
+    with tab3:
+        st.markdown("Paste a strategy JSON; we’ll convert it to blocks you can edit.")
+        txt = st.text_area("Paste JSON here", height=180, placeholder='{"version":"1.0",...}')
+        if st.button("Convert JSON to Blocks"):
             try:
-                js = json.loads(editable_json)
-                # ---- run same pipeline as before ----
-                universe = list(js["universe"])
-                bench = "SPY"
-                tk = universe if bench in universe else universe + [bench]
-
-                start = js.get("data", {}).get("start")
-                end = js.get("data", {}).get("end")
-                source = js.get("data", {}).get("source", "yahoo")
-
-                st.write(f"**Fetching data** for: {', '.join(tk)}")
-                close_all = get_prices(tk, start, end, source)
-                if close_all.empty:
-                    st.error("No data returned. Check tickers and dates.")
-                    st.stop()
-
-                validate_strategy(js)
-                panel = PricePanel.from_wide_close(close_all[universe])
-                ind = Indicators(panel)
-
-                ind_map = build_indicators(js, ind)
-                index = panel.close.index
-                sig_map = build_signals(js, ind_map, ind, index)
-
-                logic_node = js.get("logic")
-                final_signal = eval_logic(logic_node, sig_map).reindex(index).fillna(0).astype(int)
-
-                alloc = js["allocation"]
-                if alloc["type"] == "conditional_weights":
-                    weights = conditional_weights(final_signal, alloc["when_true"], alloc["when_false"])
-                elif alloc["type"] == "rules":
-                    weights = rules_weights(alloc["rules"], sig_map, index)
-                else:
-                    raise ValueError("Unsupported allocation type.")
-
-                costs = js.get("costs", {})
-                bt = backtest(
-                    close=panel.close[weights.columns].reindex(index).ffill(),
-                    weights=weights.reindex(index).fillna(0.0),
-                    costs=BrokerCosts(
-                        slippage_bps=float(costs.get("slippage_bps", 2.0)),
-                        fee_per_trade=float(costs.get("fee_per_trade", 0.0)),
-                    ),
-                    freq=js.get("rebalance", {}).get("frequency", "M"),
-                    initial_cash=10_000.0,
-                )
-                eq = bt["equity"]
-                rets = bt["returns"]
-
-                bench_close = close_all[[bench]].reindex(index).ffill()
-                bench_eq = 10_000.0 * (bench_close[bench] / bench_close[bench].iloc[0])
-                bench_ret = bench_eq.pct_change().fillna(0.0)
-
-                # Metrics
-                cum_ret = float(eq.iloc[-1] / eq.iloc[0] - 1)
-                ann_ret = annualized_return(eq)
-                shrp = sharpe_ratio(rets)
-                mdd, dd_s, dd_e, dd_series = max_drawdown_series(eq)
-                calmar = calmar_ratio(eq)
-                tr_1m = trailing_return(eq, 21)
-                tr_3m = trailing_return(eq, 63)
-                alpha, beta, r2, corr = alpha_beta_r2(rets, bench_ret)
-
-                st.success("Backtest complete.")
-                st.subheader("Performance")
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Cumulative Return", f"{cum_ret*100:,.2f}%")
-                c2.metric("Annualized Return", f"{ann_ret*100:,.2f}%")
-                c3.metric("Sharpe Ratio", f"{shrp:,.2f}")
-                c4.metric("Max Drawdown", f"{mdd*100:,.2f}%")
-                c5, c6, c7, c8 = st.columns(4)
-                c5.metric("Calmar", f"{calmar:,.2f}")
-                c6.metric("Trailing 1M", f"{(tr_1m*100) if not np.isnan(tr_1m) else float('nan') :,.2f}%")
-                c7.metric("Trailing 3M", f"{(tr_3m*100) if not np.isnan(tr_3m) else float('nan') :,.2f}%")
-                c8.metric("Vol (daily std)", f"{rets.std(ddof=0):.4f}")
-
-                st.subheader("Vs Benchmark (SPY)")
-                d1, d2, d3, d4 = st.columns(4)
-                d1.metric("Alpha (annualized)", f"{alpha*100:,.2f}%")
-                d2.metric("Beta", f"{beta:,.2f}")
-                d3.metric("R²", f"{r2:,.2f}")
-                d4.metric("Correlation", f"{corr:,.2f}")
-
-                st.subheader("Charts")
-                plot_equity(eq, bench_eq, js.get("meta", {}).get("name", "Strategy"))
-                plot_drawdown(eq)
-
-                with st.expander("Show target weights (last 10 rows)"):
-                    st.dataframe(weights.tail(10).style.format("{:.2%}"))
-
+                js_raw = json.loads(txt)
+                js = normalize_strategy_json(js_raw)
+                st.session_state["block_state"] = js
+                st.success("Converted JSON to blocks.")
             except Exception as e:
                 st.error(f"Error: {e}")
+    
+    st.divider()
+    if st.button("Run Backtest"):
+        try:
+            assert st.session_state.get("block_state") is not None, "Nothing to backtest. Use one of the three tabs first."
+            js = normalize_strategy_json(st.session_state["block_state"])
 
-    # ---------- Paste JSON ----------
-    with tab_paste:
-        st.markdown("Paste a valid strategy JSON below:")
-        json_text = st.text_area("JSON input", value="", height=320)
-        run_btn = st.button("Run Backtest (pasted JSON)")
-        if run_btn:
-            try:
-                js = json.loads(json_text)
-                # Same pipeline
-                universe = list(js["universe"])
-                bench = "SPY"
-                tk = universe if bench in universe else universe + [bench]
+            universe = list(js["universe"])
+            bench = "SPY"
+            tk = universe if bench in universe else universe + [bench]
 
-                start = js.get("data", {}).get("start")
-                end = js.get("data", {}).get("end")
-                source = js.get("data", {}).get("source", "yahoo")
+            start = js.get("data", {}).get("start")
+            end = js.get("data", {}).get("end")
 
-                st.write(f"**Fetching data** for: {', '.join(tk)}")
-                close_all = get_prices(tk, start, end, source)
-                if close_all.empty:
-                    st.error("No data returned. Check tickers and dates.")
-                    st.stop()
+            close_all = get_prices(tk, start, end, source=js.get("data", {}).get("source","yahoo"))
+            if close_all.empty:
+                st.error("No data returned. Check tickers and dates.")
+                st.stop()
 
-                validate_strategy(js)
-                panel = PricePanel.from_wide_close(close_all[universe])
-                ind = Indicators(panel)
+            validate_strategy(js)
+            panel = PricePanel.from_wide_close(close_all[universe])
+            ind = Indicators(panel)
 
-                ind_map = build_indicators(js, ind)
-                index = panel.close.index
-                sig_map = build_signals(js, ind_map, ind, index)
+            ind_map = build_indicators(js, ind)
+            index = panel.close.index
+            sig_map = build_signals(js, ind_map, ind, index)
 
-                logic_node = js.get("logic")
-                final_signal = eval_logic(logic_node, sig_map).reindex(index).fillna(0).astype(int)
+            logic_node = js.get("logic")  # signal id or None
+            final_signal = eval_logic(logic_node, sig_map).reindex(index).fillna(0).astype(int)
 
-                alloc = js["allocation"]
-                if alloc["type"] == "conditional_weights":
-                    weights = conditional_weights(final_signal, alloc["when_true"], alloc["when_false"])
-                elif alloc["type"] == "rules":
-                    weights = rules_weights(alloc["rules"], sig_map, index)
-                else:
-                    raise ValueError("Unsupported allocation type.")
+            alloc = js["allocation"]
+            if alloc.get("type") == "conditional_weights":
+                weights = conditional_weights(final_signal, alloc.get("when_true", {}), alloc.get("when_false", {}))
+            elif alloc.get("type") == "rules":
+                weights = rules_weights(alloc.get("rules", []), sig_map, index)
+            else:
+                raise ValueError("Unsupported allocation type.")
 
-                costs = js.get("costs", {})
-                bt = backtest(
-                    close=panel.close[weights.columns].reindex(index).ffill(),
-                    weights=weights.reindex(index).fillna(0.0),
-                    costs=BrokerCosts(
-                        slippage_bps=float(costs.get("slippage_bps", 2.0)),
-                        fee_per_trade=float(costs.get("fee_per_trade", 0.0)),
-                    ),
-                    freq=js.get("rebalance", {}).get("frequency", "M"),
-                    initial_cash=10_000.0,
-                )
-                eq = bt["equity"]
-                rets = bt["returns"]
+            costs = js.get("costs", {})
+            bt = backtest(
+                close=panel.close[weights.columns].reindex(index).ffill(),
+                weights=weights.reindex(index).fillna(0.0),
+                costs=BrokerCosts(
+                    slippage_bps=float(costs.get("slippage_bps", 2.0)),
+                    fee_per_trade=float(costs.get("fee_per_trade", 0.0)),
+                ),
+                freq=js.get("rebalance", {}).get("frequency", "M"),
+                initial_cash=10_000.0,
+            )
+            eq = bt["equity"]
+            rets = bt["returns"]
 
-                bench_close = close_all[[bench]].reindex(index).ffill()
-                bench_eq = 10_000.0 * (bench_close[bench] / bench_close[bench].iloc[0])
-                bench_ret = bench_eq.pct_change().fillna(0.0)
+            bench_close = close_all[[bench]].reindex(index).ffill()
+            bench_eq = 10_000.0 * (bench_close[bench] / bench_close[bench].iloc[0])
 
-                cum_ret = float(eq.iloc[-1] / eq.iloc[0] - 1)
-                ann_ret = annualized_return(eq)
-                shrp = sharpe_ratio(rets)
-                mdd, dd_s, dd_e, dd_series = max_drawdown_series(eq)
-                calmar = calmar_ratio(eq)
-                tr_1m = trailing_return(eq, 21)
-                tr_3m = trailing_return(eq, 63)
-                alpha, beta, r2, corr = alpha_beta_r2(rets, bench_ret)
+            st.subheader("Results")
+            c1, c2, c3, c4 = st.columns(4)
+            ann = annualized_return(eq)
+            vol = (rets.std(ddof=0) * (252 ** 0.5))
+            shrp = sharpe_ratio(rets)
+            mdd, _, _, _ = max_drawdown_series(eq)
+            c1.metric("Return (annualized)", f"{ann*100:,.2f}%")
+            c2.metric("Vol (annualized)", f"{vol*100:,.2f}%")
+            c3.metric("Sharpe", f"{shrp:,.2f}")
+            c4.metric("Max DD", f"{mdd*100:,.2f}%")
 
-                st.success("Backtest complete.")
-                st.subheader("Performance")
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Cumulative Return", f"{cum_ret*100:,.2f}%")
-                c2.metric("Annualized Return", f"{ann_ret*100:,.2f}%")
-                c3.metric("Sharpe Ratio", f"{shrp:,.2f}")
-                c4.metric("Max Drawdown", f"{mdd*100:,.2f}%")
-                c5, c6, c7, c8 = st.columns(4)
-                c5.metric("Calmar", f"{calmar:,.2f}")
-                c6.metric("Trailing 1M", f"{(tr_1m*100) if not np.isnan(tr_1m) else float('nan') :,.2f}%")
-                c7.metric("Trailing 3M", f"{(tr_3m*100) if not np.isnan(tr_3m) else float('nan') :,.2f}%")
-                c8.metric("Vol (daily std)", f"{rets.std(ddof=0):.4f}")
+            st.subheader("Charts")
+            plot_equity(eq, bench_eq, js.get("meta", {}).get("name", "Strategy"))
+            plot_drawdown(eq)
 
-                st.subheader("Vs Benchmark (SPY)")
-                d1, d2, d3, d4 = st.columns(4)
-                d1.metric("Alpha (annualized)", f"{alpha*100:,.2f}%")
-                d2.metric("Beta", f"{beta:,.2f}")
-                d3.metric("R²", f"{r2:,.2f}")
-                d4.metric("Correlation", f"{corr:,.2f}")
-
-                st.subheader("Charts")
-                plot_equity(eq, bench_eq, js.get("meta", {}).get("name", "Strategy"))
-                plot_drawdown(eq)
-
-                with st.expander("Show target weights (last 10 rows)"):
-                    st.dataframe(weights.tail(10).style.format("{:.2%}"))
-
-            except Exception as e:
-                st.error(f"Error: {e}")
-
-    # ---------- Upload JSON ----------
-    with tab_upload:
-        uploaded = st.file_uploader("Upload a .json file", type=["json"])
-        if uploaded is not None:
-            try:
-                json_text = uploaded.read().decode("utf-8")
-                js = json.loads(json_text)
-
-                universe = list(js["universe"])
-                bench = "SPY"
-                tk = universe if bench in universe else universe + [bench]
-
-                start = js.get("data", {}).get("start")
-                end = js.get("data", {}).get("end")
-                source = js.get("data", {}).get("source", "yahoo")
-
-                st.write(f"**Fetching data** for: {', '.join(tk)}")
-                close_all = get_prices(tk, start, end, source)
-                if close_all.empty:
-                    st.error("No data returned. Check tickers and dates.")
-                    st.stop()
-
-                validate_strategy(js)
-                panel = PricePanel.from_wide_close(close_all[universe])
-                ind = Indicators(panel)
-
-                ind_map = build_indicators(js, ind)
-                index = panel.close.index
-                sig_map = build_signals(js, ind_map, ind, index)
-
-                logic_node = js.get("logic")
-                final_signal = eval_logic(logic_node, sig_map).reindex(index).fillna(0).astype(int)
-
-                alloc = js["allocation"]
-                if alloc["type"] == "conditional_weights":
-                    weights = conditional_weights(final_signal, alloc["when_true"], alloc["when_false"])
-                elif alloc["type"] == "rules":
-                    weights = rules_weights(alloc["rules"], sig_map, index)
-                else:
-                    raise ValueError("Unsupported allocation type.")
-
-                costs = js.get("costs", {})
-                bt = backtest(
-                    close=panel.close[weights.columns].reindex(index).ffill(),
-                    weights=weights.reindex(index).fillna(0.0),
-                    costs=BrokerCosts(
-                        slippage_bps=float(costs.get("slippage_bps", 2.0)),
-                        fee_per_trade=float(costs.get("fee_per_trade", 0.0)),
-                    ),
-                    freq=js.get("rebalance", {}).get("frequency", "M"),
-                    initial_cash=10_000.0,
-                )
-                eq = bt["equity"]
-                rets = bt["returns"]
-
-                bench_close = close_all[[bench]].reindex(index).ffill()
-                bench_eq = 10_000.0 * (bench_close[bench] / bench_close[bench].iloc[0])
-                bench_ret = bench_eq.pct_change().fillna(0.0)
-
-                cum_ret = float(eq.iloc[-1] / eq.iloc[0] - 1)
-                ann_ret = annualized_return(eq)
-                shrp = sharpe_ratio(rets)
-                mdd, dd_s, dd_e, dd_series = max_drawdown_series(eq)
-                calmar = calmar_ratio(eq)
-                tr_1m = trailing_return(eq, 21)
-                tr_3m = trailing_return(eq, 63)
-                alpha, beta, r2, corr = alpha_beta_r2(rets, bench_ret)
-
-                st.success("Backtest complete.")
-                st.subheader("Performance")
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Cumulative Return", f"{cum_ret*100:,.2f}%")
-                c2.metric("Annualized Return", f"{ann_ret*100:,.2f}%")
-                c3.metric("Sharpe Ratio", f"{shrp:,.2f}")
-                c4.metric("Max Drawdown", f"{mdd*100:,.2f}%")
-                c5, c6, c7, c8 = st.columns(4)
-                c5.metric("Calmar", f"{calmar:,.2f}")
-                c6.metric("Trailing 1M", f"{(tr_1m*100) if not np.isnan(tr_1m) else float('nan') :,.2f}%")
-                c7.metric("Trailing 3M", f"{(tr_3m*100) if not np.isnan(tr_3m) else float('nan') :,.2f}%")
-                c8.metric("Vol (daily std)", f"{rets.std(ddof=0):.4f}")
-
-                st.subheader("Vs Benchmark (SPY)")
-                d1, d2, d3, d4 = st.columns(4)
-                d1.metric("Alpha (annualized)", f"{alpha*100:,.2f}%")
-                d2.metric("Beta", f"{beta:,.2f}")
-                d3.metric("R²", f"{r2:,.2f}")
-                d4.metric("Correlation", f"{corr:,.2f}")
-
-                st.subheader("Charts")
-                plot_equity(eq, bench_eq, js.get("meta", {}).get("name", "Strategy"))
-                plot_drawdown(eq)
-
-                with st.expander("Show target weights (last 10 rows)"):
-                    st.dataframe(weights.tail(10).style.format("{:.2%}"))
-
-            except Exception as e:
-                st.error(f"Error: {e}")
+            with st.expander("Show target weights (last 10 rows)"):
+                st.dataframe(weights.tail(10).style.format("{:.2%}"))
+        except Exception as e:
+            st.error(f"Error: {e}")
