@@ -5,3 +5,4 @@ yfinance
 matplotlib
 openai
 plotly
+alpaca-py
