@@ -338,26 +338,67 @@ def fetch_yahoo(tickers: List[str],
                 start: Optional[str] = None,
                 end: Optional[str] = None) -> pd.DataFrame:
     import yfinance as yf
-    start = _to_datetime(start) or (pd.Timestamp.today() - pd.DateOffset(years=5))
+    start = _to_datetime(start)
     end = _to_datetime(end) or pd.Timestamp.today()
-    df = yf.download(tickers, start=start, end=end, auto_adjust=True,
-                     progress=False, group_by="ticker")
+
+    # Pull whatever Yahoo has; don't enforce a start yet so we can detect IPO dates
+    df = yf.download(tickers, start=start or "1900-01-01", end=end,
+                     auto_adjust=True, progress=False, group_by="ticker")
+
+    # Build a wide Close
     if isinstance(df.columns, pd.MultiIndex):
         out = {}
         for t in tickers:
-            out[t] = df[(t, "Close")].rename(t)
-        wide = pd.concat(out, axis=1)
+            if (t, "Close") in df.columns:
+                s = df[(t, "Close")].rename(t)
+                if not s.dropna().empty:
+                    out[t] = s
+        wide = pd.concat(out, axis=1) if out else pd.DataFrame(index=df.index)
     else:
-        wide = pd.DataFrame({tickers[0]: df["Close"]})
+        # single ticker case
+        wide = pd.DataFrame({tickers[0]: df["Close"]}) if "Close" in df else pd.DataFrame(index=df.index)
+
     wide.index = pd.to_datetime(wide.index)
     wide = wide.sort_index().dropna(how="all")
-    wide = wide.asfreq("B").ffill().dropna(axis=1, how="all")
+
+    # Drop tickers that have no data at all
+    non_empty = [c for c in wide.columns if not wide[c].dropna().empty]
+    wide = wide[non_empty]
+
+    if wide.empty or len(non_empty) == 0:
+        return wide  # nothing to do
+
+    # Business-day calendar + ffill for alignment later
+    wide = wide.asfreq("B").ffill()
+
+    # Compute each symbol's first valid date, then pick the max (latest IPO among selected)
+    firsts = wide.apply(lambda s: s.first_valid_index())
+    # If any symbol is entirely NaN, firsts[c] will be None; drop those
+    keep = [c for c in wide.columns if firsts[c] is not None]
+    wide = wide[keep]
+    if wide.empty:
+        return wide
+
+    common_start = max(firsts[c] for c in keep if firsts[c] is not None)
+
+    # If the user gave a start, honor the later of (user_start, common_start)
+    effective_start = max(start, common_start) if start is not None else common_start
+    wide = wide[wide.index >= effective_start]
+
+    # Trim by user end if provided
+    if end is not None:
+        wide = wide[wide.index <= end]
+
+    # Final clean
+    wide = wide.dropna(how="all", axis=0).dropna(how="all", axis=1)
     return wide
+
 
 def get_prices(tickers: List[str], start: Optional[str], end: Optional[str], source: str = "yahoo") -> pd.DataFrame:
     if source.lower() not in ("yahoo", "yf"):
         raise ValueError("Only 'yahoo' source is supported in this app.")
     return fetch_yahoo(tickers, start, end)
+    
 
 # ========================
 # Core containers & indicators (unchanged)
@@ -950,6 +991,18 @@ elif st.session_state.step == 2:
             if close_all.empty:
                 st.error("No data returned. Check tickers and dates.")
                 st.stop()
+            
+            # Inform the user if we had to shift the start or drop symbols
+            effective_first = {c: close_all[c].first_valid_index() for c in close_all.columns}
+            latest = max([dt for dt in effective_first.values() if dt is not None])
+
+            if start is None or pd.to_datetime(start) < latest:
+                st.info(f"Adjusted start to {latest.date()} to match earliest available data across your tickers.")
+
+            missing = [sym for sym in tk if sym not in close_all.columns]
+            if missing:
+                st.warning(f"Dropped symbols with no data: {', '.join(missing)}")
+
 
             validate_strategy(js)
             panel = PricePanel.from_wide_close(close_all[universe])
