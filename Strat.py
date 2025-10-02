@@ -402,6 +402,31 @@ def build_signals(js: Dict[str, Any],
             raise ValueError(f"Unsupported signal type: {typ}")
     return out
 
+def _prune_logic(node: Any, valid_ids: set) -> Optional[Any]:
+    """Drop children that don't exist; collapse to None if nothing remains."""
+    if node is None:
+        return None
+    if isinstance(node, str):
+        return node if node in valid_ids else None
+    if not isinstance(node, dict):
+        return None
+
+    t = node.get("type")
+    if t in ("and", "or"):
+        kids = []
+        for ch in node.get("children", []):
+            keep = _prune_logic(ch, valid_ids)
+            if keep is not None:
+                kids.append(keep)
+        if not kids:
+            return None
+        return {"type": t, "children": kids}
+    if t == "not":
+        c = _prune_logic(node.get("child"), valid_ids)
+        return {"type":"not","child":c} if c is not None else None
+    return None
+
+
 def _sync_universe_with_references(js: dict) -> dict:
     u = set(js.get("universe", []))
     # From allocation
@@ -447,30 +472,38 @@ def _normalize_logic(node: Any) -> Any:
     return node
 
 def eval_logic(node: Union[str, Dict[str, Any]], signal_map: Dict[str, pd.Series]) -> pd.Series:
+    if not signal_map:
+        raise ValueError("signal_map is empty")
+
+    # default index to fall back on
+    default_idx = next(iter(signal_map.values())).index
+
     if node is None:
-        some = next(iter(signal_map.values()))
-        return pd.Series(0, index=some.index)
+        return pd.Series(0, index=default_idx)
+
     if isinstance(node, str):
         if node not in signal_map:
-            raise ValueError(f"Logic references unknown signal id: {node}")
+            # unknown id -> treat as always-false
+            return pd.Series(0, index=default_idx)
         return signal_map[node].astype(int)
+
     t = node.get("type")
-    if t == "and":
+    if t in ("and", "or"):
+        children = node.get("children", [])
+        if not children:  # <- guard empty
+            return pd.Series(0, index=default_idx)
         s = None
-        for ch in node["children"]:
-            v = eval_logic(ch if isinstance(ch, dict) else ch, signal_map)
-            s = v if s is None else ((s == 1) & (v == 1)).astype(int)
-        return s
-    if t == "or":
-        s = None
-        for ch in node["children"]:
-            v = eval_logic(ch if isinstance(ch, dict) else ch, signal_map)
-            s = v if s is None else ((s == 1) | (v == 1)).astype(int)
+        for ch in children:
+            v = eval_logic(ch, signal_map)
+            s = v if s is None else ((s & v).astype(int) if t == "and" else ((s | v).astype(int)))
         return s
     if t == "not":
-        v = eval_logic(node["child"], signal_map)
+        v = eval_logic(node.get("child"), signal_map)
         return (1 - v).astype(int)
-    raise ValueError(f"Unsupported logic type: {t}")
+
+    # unknown node -> false
+    return pd.Series(0, index=default_idx)
+
 
 def conditional_weights(cond: pd.Series, w_true: Dict[str, float], w_false: Dict[str, float]) -> pd.DataFrame:
     idx = cond.index
@@ -1133,6 +1166,8 @@ elif st.session_state.step == 2:
                 sig_map = build_signals(js, ind_map, ind, index)
 
                 logic_node = _normalize_logic(js.get("logic"))
+                logic_node = _prune_logic(logic_node, valid_ids=set(sig_map.keys()))
+
                 final_signal = (
                     pd.Series(0, index=index)
                     if not sig_map else eval_logic(logic_node, sig_map).reindex(index).fillna(0).astype(int))
