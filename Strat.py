@@ -739,6 +739,10 @@ if "debug_log" not in st.session_state:
     st.session_state.debug_log = []  # list of dicts per step
 if "final_json_text" not in st.session_state:
     st.session_state.final_json_text = ""
+if "gen_ready" not in st.session_state:
+    st.session_state.gen_ready = False
+if "run_bt" not in st.session_state:
+    st.session_state.run_bt = False
 
 if st.session_state.step == 1:
     st.subheader("Overview")
@@ -954,6 +958,13 @@ elif st.session_state.step == 2:
             final_js["allocation"] = alloc
 
             s.update(label="Strategy ready", state="complete")
+            # Store artifacts to session, then rerun so UI draws outside `if run:`
+            st.session_state.final_json_text = json.dumps(final_js, indent=2)
+            st.session_state.gen_ready = True
+            st.session_state.run_bt = False  # reset if we’re making a new strategy
+            st.session_state.debug_log = st.session_state.debug_log  # keep logs
+            st.rerun()
+
 
         # Present final JSON and debug info
         st.success("Generation complete.")
@@ -976,124 +987,151 @@ elif st.session_state.step == 2:
         st.session_state.final_json_text = json.dumps(final_js, indent=2)
         st.text_area("Strategy JSON", value=st.session_state.final_json_text, height=360, key="final_json_editor")
 
-        # --- Backtest trigger ---
+    # ---- Editor & Run Backtest (persists across reruns) ----
+    if st.session_state.gen_ready:
+        st.success("Generation complete.")
+
+        with st.expander("Debug: model outputs & errors"):
+            for row in st.session_state.debug_log:
+                st.markdown(f"**Step:** {row['step']}")
+                if row.get("error"):
+                    st.error(row["error"])
+                st.code(row.get("raw",""), language="json")
+
+        st.subheader("Final Strategy JSON (editable)")
+        # Initialize the editor value only once; avoid resetting user edits on rerun
+        if "final_json_editor" not in st.session_state:
+            st.session_state.final_json_editor = st.session_state.final_json_text
+        st.text_area("Strategy JSON", key="final_json_editor", height=360)
+
         if st.button("Run Backtest"):
             st.session_state.run_bt = True
+            st.rerun()
+    # ---- Backtest & Results ----
+    if st.session_state.gen_ready and st.session_state.run_bt:
+        with st.spinner("Running backtest..."):
+            try:
+                js = json.loads(st.session_state.final_json_editor)
 
-        if st.session_state.get("run_bt", False):
-            with st.spinner("Running backtest..."):
+                errs = validate_strategy(js)
+                if errs:
+                    st.error("Validation errors:\n- " + "\n- ".join(errs))
+                    st.stop()
+
+                universe = list(js["universe"])
+                if not universe:
+                    st.error("Universe is empty.")
+                    st.stop()
+
+                bench = "SPY"
+                tk = universe if bench in universe else universe + [bench]
+
+                start = js.get("data", {}).get("start")
+                end = js.get("data", {}).get("end")
+
                 try:
-                    # Parse the edited JSON
-                    js = json.loads(st.session_state.final_json_editor)
+                    close_all = fetch_yahoo(tk, start, end)
+                except Exception as fetch_err:
+                    st.exception(fetch_err)
+                    st.stop()
 
-                    # Validate
-                    errs = validate_strategy(js)
-                    if errs:
-                        st.error("Validation errors:\n- " + "\n- ".join(errs))
-                        st.stop()
+                if close_all.empty:
+                    st.error("No data returned. Check tickers and dates.")
+                    st.stop()
 
-                    # Universe & benchmark
-                    universe = list(js["universe"])
-                    if not universe:
-                        st.error("Universe is empty.")
-                        st.stop()
+                effective_first = {c: close_all[c].first_valid_index() for c in close_all.columns}
+                latest = max([dt for dt in effective_first.values() if dt is not None])
+                if start is None or (pd.to_datetime(start) < latest):
+                    st.info(f"Adjusted start to {latest.date()} to match earliest available data across your tickers.")
 
-                    bench = "SPY"
-                    tk = universe if bench in universe else universe + [bench]
+                missing = [sym for sym in tk if sym not in close_all.columns]
+                if missing:
+                    st.warning(f"Dropped symbols with no data: {', '.join(missing)}")
 
-                    start = js.get("data", {}).get("start")
-                    end = js.get("data", {}).get("end")
+                available_universe = [u for u in universe if u in close_all.columns]
+                if not available_universe:
+                    st.error("None of the universe tickers returned data.")
+                    st.stop()
 
-                    # Fetch prices (guard against import/network errors)
-                    try:
-                        close_all = fetch_yahoo(tk, start, end)
-                    except Exception as fetch_err:
-                        st.exception(fetch_err)
-                        st.stop()
+                available_set = set(available_universe)
+                js["indicators"] = [
+                    ind for ind in js.get("indicators", [])
+                    if ind.get("params", {}).get("symbol") in available_set
+                    or ind["type"] in ("drawdown", "max_drawdown") and ind.get("params", {}).get("symbol") in (available_set | {None})
+                ]
 
-                    if close_all.empty:
-                        st.error("No data returned. Check tickers and dates.")
-                        st.stop()
+                valid_ind_ids = {ind["id"] for ind in js["indicators"]}
+                def _side_ok(side):
+                    k = side.get("kind")
+                    if k == "price":
+                        return side.get("symbol") in available_set
+                    if k == "indicator":
+                        return side.get("ref") in valid_ind_ids
+                    if k == "const":
+                        return isinstance(side.get("value"), (int, float))
+                    return False
 
-                    # Inform about effective start & missing symbols
-                    effective_first = {c: close_all[c].first_valid_index() for c in close_all.columns}
-                    latest = max([dt for dt in effective_first.values() if dt is not None])
-                    if start is None or (pd.to_datetime(start) < latest):
-                        st.info(f"Adjusted start to {latest.date()} to match earliest available data across your tickers.")
+                js["signals"] = [
+                    s for s in js.get("signals", [])
+                    if _side_ok(s.get("left", {})) and _side_ok(s.get("right", {}))
+                ]
 
-                    missing = [sym for sym in tk if sym not in close_all.columns]
-                    if missing:
-                        st.warning(f"Dropped symbols with no data: {', '.join(missing)}")
+                # If logic points to a signal we just dropped, null it (rules alloc still works)
+                if isinstance(js.get("logic"), str) and js["logic"] not in {s["id"] for s in js["signals"]}:
+                    js["logic"] = None
 
-                    # Build panel on the actual available universe
-                    available_universe = [u for u in universe if u in close_all.columns]
-                    if not available_universe:
-                        st.error("None of the universe tickers returned data.")
-                        st.stop()
+                panel = PricePanel.from_wide_close(close_all[available_universe])
+                ind = Indicators(panel)
+                ind_map = build_indicators(js, ind)
+                index = panel.close.index
+                sig_map = build_signals(js, ind_map, ind, index)
 
-                    panel = PricePanel.from_wide_close(close_all[available_universe])
-                    ind = Indicators(panel)
-                    ind_map = build_indicators(js, ind)
-                    index = panel.close.index
-                    sig_map = build_signals(js, ind_map, ind, index)
+                final_signal = (
+                    pd.Series(0, index=index)
+                    if not sig_map else eval_logic(js.get("logic"), sig_map).reindex(index).fillna(0).astype(int)
+                )
 
-                    # Final signal series
-                    final_signal = (
-                        pd.Series(0, index=index)
-                        if not sig_map else eval_logic(js.get("logic"), sig_map).reindex(index).fillna(0).astype(int)
-                    )
+                alloc = js["allocation"]
+                if alloc.get("type") == "conditional_weights":
+                    weights = conditional_weights(final_signal, alloc.get("when_true", {}), alloc.get("when_false", {}))
+                elif alloc.get("type") == "rules":
+                    weights = rules_weights(alloc.get("rules", []), sig_map, index)
+                else:
+                    st.error("Unsupported allocation type.")
+                    st.stop()
 
-                    # Portfolio weights over time
-                    alloc = js["allocation"]
-                    if alloc.get("type") == "conditional_weights":
-                        weights = conditional_weights(
-                            final_signal,
-                            alloc.get("when_true", {}),
-                            alloc.get("when_false", {}),
-                        )
-                    elif alloc.get("type") == "rules":
-                        weights = rules_weights(alloc.get("rules", []), sig_map, index)
-                    else:
-                        st.error("Unsupported allocation type.")
-                        st.stop()
+                costs = js.get("costs", {})
+                bt = backtest(
+                    close=panel.close[weights.columns].reindex(index).ffill(),
+                    weights=weights.reindex(index).fillna(0.0),
+                    costs=BrokerCosts(
+                        slippage_bps=float(costs.get("slippage_bps", 2.0)),
+                        fee_per_trade=float(costs.get("fee_per_trade", 0.0)),
+                    ),
+                    freq=js.get("rebalance", {}).get("frequency", "W"),
+                    initial_cash=10_000.0,
+                )
+                eq = bt["equity"]
+                rets = bt["returns"]
 
-                    # Backtest
-                    costs = js.get("costs", {})
-                    bt = backtest(
-                        close=panel.close[weights.columns].reindex(index).ffill(),
-                        weights=weights.reindex(index).fillna(0.0),
-                        costs=BrokerCosts(
-                            slippage_bps=float(costs.get("slippage_bps", 2.0)),
-                            fee_per_trade=float(costs.get("fee_per_trade", 0.0)),
-                        ),
-                        freq=js.get("rebalance", {}).get("frequency", "W"),
-                        initial_cash=10_000.0,
-                    )
-                    eq = bt["equity"]
-                    rets = bt["returns"]
+                bench_col = bench if bench in close_all.columns else available_universe[0]
+                bench_close = close_all[[bench_col]].reindex(index).ffill()
+                bench_eq = 10_000.0 * (bench_close[bench_col] / bench_close[bench_col].iloc[0])
 
-                    # Choose a benchmark that actually exists
-                    bench_col = bench if bench in close_all.columns else available_universe[0]
-                    bench_close = close_all[[bench_col]].reindex(index).ffill()
-                    bench_eq = 10_000.0 * (bench_close[bench_col] / bench_close[bench_col].iloc[0])
+                st.subheader("Results")
+                c1, c2, c3, c4 = st.columns(4)
+                ann = annualized_return(eq)
+                vol = (rets.std(ddof=0) * (252 ** 0.5))
+                shrp = sharpe_ratio(rets)
+                mdd, _, _, _ = max_drawdown_series(eq)
+                c1.metric("Return (annualized)", f"{ann*100:,.2f}%")
+                c2.metric("Vol (annualized)", f"{vol*100:,.2f}%")
+                c3.metric("Sharpe", f"{shrp:,.2f}")
+                c4.metric("Max DD", f"{mdd*100:,.2f}%")
 
-                    # Results
-                    st.subheader("Results")
-                    c1, c2, c3, c4 = st.columns(4)
-                    ann = annualized_return(eq)
-                    vol = (rets.std(ddof=0) * (252 ** 0.5))
-                    shrp = sharpe_ratio(rets)
-                    mdd, _, _, _ = max_drawdown_series(eq)
-                    c1.metric("Return (annualized)", f"{ann*100:,.2f}%")
-                    c2.metric("Vol (annualized)", f"{vol*100:,.2f}%")
-                    c3.metric("Sharpe", f"{shrp:,.2f}")
-                    c4.metric("Max DD", f"{mdd*100:,.2f}%")
+                st.subheader("Charts")
+                plot_equity(eq, bench_eq, js.get("meta", {}).get("name", "Strategy"))
+                plot_drawdown(eq)
 
-                    st.subheader("Charts")
-                    plot_equity(eq, bench_eq, js.get("meta", {}).get("name", "Strategy"))
-                    plot_drawdown(eq)
-
-                except Exception as e:
-                    # Catch anything unexpected so the app doesn’t “blink” back
-                    st.exception(e)
-                    # Keep the run_bt flag True so the user can fix JSON and re-run without another click
+            except Exception as e:
+                st.exception(e)
