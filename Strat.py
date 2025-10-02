@@ -1170,9 +1170,7 @@ elif st.session_state.step == 2:
 
                 final_signal = (
                     pd.Series(0, index=index)
-                    if not sig_map else eval_logic(logic_node, sig_map).reindex(index).fillna(0).astype(int)
-                )
-
+                    if not sig_map else eval_logic(logic_node, sig_map).reindex(index).fillna(0).astype(int))
 
                 alloc = js["allocation"]
                 if alloc.get("type") == "conditional_weights":
