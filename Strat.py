@@ -616,7 +616,6 @@ def _llm_call_json(step_name: str, system_prompt: str, user_payload: Any) -> Tup
         client = OpenAI()
         resp = client.responses.create(
             model=MODEL_NAME,
-            temperature=LLM_TEMPERATURE,
             reasoning={"effort": LLM_REASONING},
             input=[
                 {"role": "system", "content": system_prompt},
