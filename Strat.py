@@ -471,6 +471,16 @@ def _normalize_logic(node: Any) -> Any:
             node["child"] = _normalize_logic(child)
     return node
 
+def _normalize_signals(sig_list):
+    out = []
+    for s in sig_list or []:
+        if "type" not in s and "op" in s:
+            s = {**s, "type": s["op"]}
+            s.pop("op", None)
+        out.append(s)
+    return out
+
+
 def eval_logic(node: Union[str, Dict[str, Any]], signal_map: Dict[str, pd.Series]) -> pd.Series:
     if not signal_map:
         raise ValueError("signal_map is empty")
@@ -989,6 +999,8 @@ elif st.session_state.step == 2:
         # Combine
         with st.status("Combining & validating...", expanded=False) as s:
             final_js = assemble_final_json(intent_js, uni_js, ind_js, sig_js, alloc_js, ops_js)
+            final_js["signals"] = _normalize_signals(final_js.get("signals", []))
+            final_js["logic"]   = _normalize_logic(final_js.get("logic"))
             final_js = _sync_universe_with_references(final_js)
             errors = validate_strategy(final_js)
             errors = validate_strategy(final_js)
