@@ -41,7 +41,7 @@ try:
 except Exception:
     _OPENAI_AVAILABLE = False
 
-LLM_MAX_TOKENS = 1200
+LLM_MAX_TOKENS = 2000
 LLM_TEMPERATURE = 0.0
 LLM_REASONING: Literal["minimal","low","medium","high"] = "low"
 
