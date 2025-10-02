@@ -563,7 +563,6 @@ def backtest(close: pd.DataFrame,
     idx = close.index
     syms = list(weights.columns)
     rb_dates = rebalance_dates(idx, freq)
-    weights_reb = weights.reindex(rb_dates).fillna(0.0)  
     positions = {s: 0.0 for s in syms}
     cash = initial_cash
     equity = []
@@ -592,7 +591,7 @@ def backtest(close: pd.DataFrame,
         equity.append((dt, port_val))
     eq = pd.Series(dict(equity)).sort_index()
     rets = eq.pct_change().fillna(0.0)
-    return {"equity": eq, "returns": rets, "weights_reb": weights_reb, "rb_dates": rb_dates}
+    return {"equity": eq, "returns": rets}
 
 def annualized_return(equity: pd.Series) -> float:
     years = (equity.index[-1] - equity.index[0]).days / 365.25
@@ -1171,7 +1170,9 @@ elif st.session_state.step == 2:
 
                 final_signal = (
                     pd.Series(0, index=index)
-                    if not sig_map else eval_logic(logic_node, sig_map).reindex(index).fillna(0).astype(int))
+                    if not sig_map else eval_logic(logic_node, sig_map).reindex(index).fillna(0).astype(int)
+                )
+
 
                 alloc = js["allocation"]
                 if alloc.get("type") == "conditional_weights":
@@ -1193,28 +1194,6 @@ elif st.session_state.step == 2:
                     freq=js.get("rebalance", {}).get("frequency", "W"),
                     initial_cash=10_000.0,
                 )
-
-                # --- Rebalance ledger (table) ---
-                ledger = bt.get("weights_reb")
-                if ledger is not None and not ledger.empty:
-                    ledger = ledger.reindex(columns=weights.columns)  # keep same column order
-                    view = (ledger * 100).round(2)
-                    st.subheader("Rebalance Ledger (executed target weights)")
-                    st.dataframe(
-                        view.sort_index(ascending=False),
-                        use_container_width=True,
-                        height=min(520, 40 + 28 * min(20, len(view)))
-                    )
-                    st.download_button(
-                        "Download ledger (CSV)",
-                        data=ledger.to_csv(index=True),
-                        file_name="rebalance_ledger.csv",
-                        mime="text/csv",
-                    )
-                else:
-                    st.info("No rebalance rows to display (check your dates/frequency).")
-
-
                 eq = bt["equity"]
                 rets = bt["returns"]
 
