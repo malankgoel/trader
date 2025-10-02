@@ -402,6 +402,50 @@ def build_signals(js: Dict[str, Any],
             raise ValueError(f"Unsupported signal type: {typ}")
     return out
 
+def _sync_universe_with_references(js: dict) -> dict:
+    u = set(js.get("universe", []))
+    # From allocation
+    alloc = js.get("allocation", {})
+    if alloc.get("type") == "conditional_weights":
+        u |= set((alloc.get("when_true") or {}).keys())
+        u |= set((alloc.get("when_false") or {}).keys())
+    elif alloc.get("type") == "rules":
+        for r in alloc.get("rules", []):
+            if "weights" in r and isinstance(r["weights"], dict):
+                u |= set(r["weights"].keys())
+            if "default" in r and isinstance(r["default"], dict):
+                u |= set(r["default"].keys())
+
+                # From signals (price sides)
+    for s in js.get("signals", []):
+        for side in ("left", "right"):
+            node = s.get(side, {})
+            if isinstance(node, dict) and node.get("kind") == "price" and node.get("symbol"):
+                u.add(node["symbol"])
+
+    js["universe"] = sorted(u)
+    return js
+
+def _normalize_logic(node: Any) -> Any:
+    # Accept {"type":"or","of":[...]} or {"type":"and","of":[...]}
+    if isinstance(node, dict):
+        t = node.get("type")
+        if t in ("and", "or"):
+            # Map 'of' -> 'children' if present
+            if "children" not in node and "of" in node and isinstance(node["of"], list):
+                node = {**node, "children": node["of"]}
+                node.pop("of", None)
+            # Recursively normalize children
+            kids = []
+            for ch in node.get("children", []):
+                kids.append(_normalize_logic(ch))
+            node["children"] = kids
+        elif t == "not":
+            # Handle alt key names defensively
+            child = node.get("child", node.get("negate"))
+            node["child"] = _normalize_logic(child)
+    return node
+
 def eval_logic(node: Union[str, Dict[str, Any]], signal_map: Dict[str, pd.Series]) -> pd.Series:
     if node is None:
         some = next(iter(signal_map.values()))
@@ -912,6 +956,8 @@ elif st.session_state.step == 2:
         # Combine
         with st.status("Combining & validating...", expanded=False) as s:
             final_js = assemble_final_json(intent_js, uni_js, ind_js, sig_js, alloc_js, ops_js)
+            final_js = _sync_universe_with_references(final_js)
+            errors = validate_strategy(final_js)
             errors = validate_strategy(final_js)
             st.session_state.debug_log.append({"step":"combine_validate","raw":json.dumps(final_js, separators=(",",":")), "error":"; ".join(errors) if errors else None})
 
@@ -929,7 +975,7 @@ elif st.session_state.step == 2:
                 fix_js, raw_fix, err_fix = _llm_call_json("repair", AUDITOR_REPAIR_PROMPT, repair_payload)
                 st.session_state.debug_log.append({"step":"repair","raw":raw_fix,"error":err_fix})
                 if not err_fix and isinstance(fix_js, dict):
-                    final_js = fix_js
+                    final_js = _sync_universe_with_references(fix_js)
                     errors2 = validate_strategy(final_js)
                     st.session_state.debug_log.append({"step":"post_repair_validate","raw":json.dumps(final_js, separators=(",",":")), "error":"; ".join(errors2) if errors2 else None})
                     if errors2:
@@ -1086,10 +1132,10 @@ elif st.session_state.step == 2:
                 index = panel.close.index
                 sig_map = build_signals(js, ind_map, ind, index)
 
+                logic_node = _normalize_logic(js.get("logic"))
                 final_signal = (
                     pd.Series(0, index=index)
-                    if not sig_map else eval_logic(js.get("logic"), sig_map).reindex(index).fillna(0).astype(int)
-                )
+                    if not sig_map else eval_logic(logic_node, sig_map).reindex(index).fillna(0).astype(int))
 
                 alloc = js["allocation"]
                 if alloc.get("type") == "conditional_weights":
