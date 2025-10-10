@@ -488,10 +488,6 @@ def llm_parse_dsl(user_text: str) -> Tuple[Optional[dict], Optional[str]]:
                 {"role": "system", "content": DSL_PARSE_PROMPT},
                 {"role": "user", "content": user_text.strip()}
             ],
-            format={
-                "type": "json_schema",
-                "json_schema": DSL_JSON_SCHEMA
-            },
             max_output_tokens=LLM_MAX_TOKENS,
         )
         text = _parse_responses_output(resp).strip()
