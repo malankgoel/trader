@@ -474,27 +474,49 @@ def _parse_responses_output(resp) -> str:
 
 def llm_parse_dsl(user_text: str) -> Tuple[Optional[dict], Optional[str]]:
     """
-    Returns (dsl_dict_or_none, error_str_or_none). Strict JSON schema enforced.
+    Returns (dsl_dict_or_none, error_str_or_none) using Chat Completions + function calling.
     """
     if not _OPENAI_AVAILABLE:
         return None, "OpenAI SDK not available."
 
     try:
         client = OpenAI()
-        resp = client.responses.create(
+
+        # 1) Define a single function tool that exactly matches your DSL schema
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "emit_dsl",
+                "description": "Emit the Strategy DSL object strictly per the schema.",
+                "parameters": DSL_JSON_SCHEMA["schema"]
+            }
+        }]
+
+        # 2) Call chat.completions with a forced tool choice (guarantees structured JSON)
+        comp = client.chat.completions.create(
             model=MODEL_NAME,
-            reasoning={"effort": LLM_REASONING},
-            input=[
+            temperature=0,
+            messages=[
                 {"role": "system", "content": DSL_PARSE_PROMPT},
-                {"role": "user", "content": user_text.strip()}
+                {"role": "user", "content": user_text.strip()},
             ],
-            max_output_tokens=LLM_MAX_TOKENS,
+            tools=tools,
+            tool_choice={"type": "function", "function": {"name": "emit_dsl"}}
         )
-        text = _parse_responses_output(resp).strip()
-        obj = json.loads(text)
+
+        # 3) Pull the function arguments (the JSON payload) out of the first message
+        choice = comp.choices[0]
+        msg = choice.message
+        if not msg.tool_calls or msg.tool_calls[0].function.name != "emit_dsl":
+            return None, "Parser did not return the expected function call."
+
+        args_json = msg.tool_calls[0].function.arguments
+        obj = json.loads(args_json)
         return obj, None
+
     except Exception as e:
-        return None, f"LLM parse error: {e}"
+        return None, f"LLM parse error (chat.completions): {e}"
+
 
 
 # ========================
