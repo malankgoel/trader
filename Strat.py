@@ -927,46 +927,74 @@ def semantic_assertions(eq_logic: pd.Series,
 
 def render_roundtrip_bullets(engine: dict) -> List[str]:
     uni = ", ".join(engine.get("universe", []))
-    rb = engine.get("rebalance",{}).get("frequency","W")
-    data = engine.get("data",{})
+    rb = engine.get("rebalance", {}).get("frequency", "W")
+    data = engine.get("data", {})
     start = data.get("start")
     end = data.get("end") or "latest"
-    alloc = engine.get("allocation",{})
+    costs = engine.get("costs", {})
+    slp = costs.get("slippage_bps", None)
+    fee = costs.get("fee_per_trade", None)
+
+    def _fmt_weights(w: Dict[str,float]) -> str:
+        # show all tickers with weight as percentages, sorted desc
+        if not w:
+            return "(none)"
+        pairs = sorted([(k, v) for k,v in w.items()], key=lambda x: -x[1])
+        return ", ".join([f"{k} {v*100:.0f}%" for k,v in pairs])
+
+    bullets = [f"Universe: {uni}", f"Rebalance: {rb}", f"Data: {start} to {end}"]
+
+    alloc = engine.get("allocation", {})
     if alloc.get("type") == "conditional_weights":
-        wt_true = alloc.get("when_true",{})
-        wt_false = alloc.get("when_false",{})
-        hedgers = [k for k,v in wt_false.items() if v >= 0.99]
-        hedge_str = hedgers[0] if hedgers else "hedge basket"
-        bullets = [
-            f"Universe: {uni}",
-            "Position when logic is TRUE: weighted long across universe.",
-            f"When FALSE: hedge into {hedge_str}.",
-            f"Rebalance: {rb}",
-            f"Data: {start} to {end}",
-        ]
-    else:
-        bullets = [
-            f"Universe: {uni}",
-            "Always invested using rule defaults (unless a rule triggers).",
-            f"Rebalance: {rb}",
-            f"Data: {start} to {end}",
-        ]
+        wt_true = alloc.get("when_true", {})
+        wt_false = alloc.get("when_false", {})
+        bullets.insert(1, f"When logic TRUE: {_fmt_weights(wt_true)}")
+        bullets.insert(2, f"When logic FALSE: {_fmt_weights(wt_false)}")
+    elif alloc.get("type") == "rules":
+        rules = alloc.get("rules", [])
+        if rules:
+            if "weights" in rules[0]:
+                bullets.insert(1, f"When rule triggers: {_fmt_weights(rules[0]['weights'])}")
+            if "default" in rules[-1]:
+                bullets.insert(2, f"Default: {_fmt_weights(rules[-1]['default'])}")
+
+    if slp is not None or fee is not None:
+        pieces = []
+        if slp is not None: pieces.append(f"slippage {float(slp):g} bps")
+        if fee is not None and float(fee) != 0: pieces.append(f"fee ${float(fee):g}/trade")
+        if pieces:
+            bullets.append("Costs: " + ", ".join(pieces))
+
     return bullets
 
+
 def coverage_gates(dsl: dict, bullets: List[str]) -> List[str]:
-    # Minimal gate: every clause must have coverage and at least one keyword hits the bullets text.
     errors = []
     cov = dsl.get("coverage", {})
-    clause_text = {c["id"]: c["text"] for c in dsl.get("clauses", [])}
-    missing = [cid for cid, nodes in cov.items() if not nodes]
+    clause_ids = {c["id"] for c in dsl.get("clauses", [])}
+
+    # 1) Every clause must exist in coverage with at least one node id
+    missing = [cid for cid in clause_ids if cid not in cov or not cov[cid]]
     if missing:
         errors.append(f"Clauses have empty coverage: {missing}")
-    joined = " ".join(bullets).lower()
-    for cid, text in clause_text.items():
-        toks = [t.strip().lower() for t in text.replace(","," ").split() if len(t.strip())>=4]
-        if toks and not any(t in joined for t in toks[:8]):  # cheap overlap check
-            errors.append(f"Clause appears not reflected after compile: '{text[:60]}...'")
+
+    # 2) The node ids referenced must be plausible:
+    #    - 'logic' is allowed
+    #    - any signal id in dsl['signals']
+    #    - ops pseudo-ids: ops.data, ops.rebalance, ops.costs
+    allowed = {"logic", "ops.data", "ops.rebalance", "ops.costs"}
+    allowed |= {s["id"] for s in dsl.get("signals", [])}
+    bad_refs = {}
+    for cid, nodes in cov.items():
+        for n in nodes:
+            if n not in allowed:
+                bad_refs.setdefault(cid, []).append(n)
+    if bad_refs:
+        errors.append("Coverage references unknown nodes: " + ", ".join([f"{k}:{v}" for k,v in bad_refs.items()]))
+
+    # No fuzzy text matching anymore.
     return errors
+
 
 
 # ========================
