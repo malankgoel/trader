@@ -495,7 +495,6 @@ def llm_parse_dsl(user_text: str) -> Tuple[Optional[dict], Optional[str]]:
         # 2) Call chat.completions with a forced tool choice (guarantees structured JSON)
         comp = client.chat.completions.create(
             model=MODEL_NAME,
-            temperature=0,
             messages=[
                 {"role": "system", "content": DSL_PARSE_PROMPT},
                 {"role": "user", "content": user_text.strip()},
